@@ -1,6 +1,8 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
+// Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
+const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
 
 // ---------- Utilitaires ----------
 const $ = (s, el = document) => el.querySelector(s);
@@ -60,7 +62,7 @@ const DB = {
 
 // ---------- État ----------
 const S = {
-  settings: { worker: '', syncUrl: 'https://script.google.com/macros/s/AKfycbwkJyZ63CFji-c54KgUA4Urboc6ZH59BFfxyqJmP-1a9bsepDa17FmJjJtizq4FV5U/exec', syncToken: '', autoSync: true, lastSync: null, lastBackup: null, device: '' },
+  settings: { worker: '', syncUrl: '', syncToken: '', autoSync: true, lastSync: null, lastBackup: null, device: '' },
   template: null, buildings: [], rounds: new Map(), issues: new Map(), log: [],
   ui: { filter: 'all', issueTab: 'open', issueBld: '', histBld: '', logBld: '', logQ: '', logLimit: 150, collapsed: {} }
 };
@@ -853,6 +855,7 @@ async function registerSW() {
     await DB.open();
     const [settings, template, buildings, rounds, issues, log] = await Promise.all([DB.get('kv', 'settings'), DB.get('kv', 'template'), DB.get('kv', 'buildings'), DB.all('rounds'), DB.all('issues'), DB.all('log')]);
     if (settings) S.settings = { ...S.settings, ...settings };
+    if ((S.settings.syncUrl || '').includes(RETIRED_SYNC_URL_PART)) { S.settings.syncUrl = ''; await saveSettings(); }
     S.template = template || buildTemplate();
     if (!template) { await saveTemplate(); }
     S.buildings = buildings || [];
