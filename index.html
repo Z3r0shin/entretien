@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr-CA">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Entretien préventif</title>
+  <meta name="description" content="Tournées d'entretien préventif horodatées, hors-ligne.">
+  <meta name="theme-color" content="#1f4e79">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="banner" class="banner" hidden></div>
+  <main id="view" class="view" aria-live="polite"></main>
+  <nav class="tabbar" id="tabbar">
+    <a href="#/" data-tab="home"><span class="ico">⌂</span><span>Accueil</span></a>
+    <a href="#/suivi" data-tab="suivi"><span class="ico">⚠</span><span>Suivis</span></a>
+    <a href="#/historique" data-tab="historique"><span class="ico">☰</span><span>Historique</span></a>
+    <a href="#/journal" data-tab="journal"><span class="ico">⏱</span><span>Journal</span></a>
+    <a href="#/reglages" data-tab="reglages"><span class="ico">⚙</span><span>Réglages</span></a>
+  </nav>
+  <dialog id="sheet" class="sheet"><div id="sheetBody"></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <input type="file" id="photoInput" accept="image/*" capture="environment" hidden>
+  <input type="file" id="importInput" accept="application/json,.json" hidden>
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
