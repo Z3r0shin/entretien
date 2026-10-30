@@ -1,6 +1,6 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.1.0';
 // Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
 const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
 
@@ -183,7 +183,9 @@ function viewHome() {
   if (!blds.length) {
     h += `<div class="card"><h3>Ajoute tes écoles</h3><p class="muted">Une tournée est toujours liée à un bâtiment.</p>
       <label class="field"><span>Nom de l'école / du bâtiment</span><input type="text" id="newBld" placeholder="ex. École Saint-Jean"></label>
-      <button class="btn primary" data-act="addBuilding">Ajouter</button></div>`;
+      <button class="btn primary" data-act="addBuilding">Ajouter</button>
+      <p class="muted" style="margin-top:12px">Ou récupère tes écoles depuis ta feuille Google (après avoir configuré la synchro) :</p>
+      <button class="btn" data-act="importBlds">Importer mes écoles</button></div>`;
     return h;
   }
   const tasks = flatTasks();
@@ -195,7 +197,7 @@ function viewHome() {
     const cur = rounds.find(r => !r.endedAt);
     const lastR = rounds.find(r => r.endedAt);
     h += `<div class="card"><div class="head"><div><h3>${esc(b.name)}</h3>
-      <small>${lastR ? 'Dernière tournée : ' + fmtShort(lastR.startedAt) : 'Aucune tournée encore'}</small></div></div>
+      ${b.address ? `<small>${esc(b.address)}</small><br>` : ''}<small>${lastR ? 'Dernière tournée : ' + fmtShort(lastR.startedAt) : 'Aucune tournée encore'}</small></div></div>
       <div class="stats">${due ? `<span class="pill due">${due} tâche${due > 1 ? 's' : ''} due${due > 1 ? 's' : ''}</span>` : '<span class="pill ok">Rien de dû</span>'}
       ${open ? `<a class="pill todo" href="#/suivi">${open} suivi${open > 1 ? 's' : ''} ouvert${open > 1 ? 's' : ''}</a>` : ''}</div>
       <div class="actions">${cur
@@ -526,7 +528,8 @@ function viewSettings() {
     <label class="field"><span>Nom de cet appareil (optionnel)</span><input type="text" data-change="setting" data-key="device" value="${esc(st.device)}" placeholder="ex. Cell de Guillaume"></label></div>`;
   h += `<div class="card"><h3>Écoles / bâtiments</h3><ul class="list">${S.buildings.map(b => `<li class="switch"><span>${esc(b.name)}${b.archived ? ' <span class="pill off">archivée</span>' : ''}</span>
       <span class="actions"><button class="btn small" data-act="renameBld" data-id="${b.id}">Renommer</button><button class="btn small" data-act="archiveBld" data-id="${b.id}">${b.archived ? 'Réactiver' : 'Archiver'}</button></span></li>`).join('') || '<li class="muted">Aucune.</li>'}</ul>
-    <label class="field"><span>Ajouter</span><input type="text" id="newBld" placeholder="Nom de l'école"></label><button class="btn" data-act="addBuilding">Ajouter</button></div>`;
+    <label class="field"><span>Ajouter</span><input type="text" id="newBld" placeholder="Nom de l'école"></label><span class="actions"><button class="btn" data-act="addBuilding">Ajouter</button><button class="btn" data-act="importBlds">Importer de la feuille Google</button></span>
+    ${S.settings.lastBuildingsImport ? `<p class="muted">Dernier import : ${fmtDT(S.settings.lastBuildingsImport)}${S.settings.subsector ? ' · ' + esc(S.settings.subsector) : ''}</p>` : ''}</div>`;
   const active = flatTasks().length, sug = flatTasks(false).filter(x => x.task.suggested && !x.task.active).length;
   h += `<div class="card"><h3>Liste de tâches</h3><p class="muted">${active} tâches actives · ${sug} suggestions désactivées (sources : RBQ, MEQ, SHQ, INSPQ…)</p><button class="btn" data-act="go" data-to="#/modele">Modifier la liste et les fréquences</button></div>`;
   h += `<div class="card"><h3>Google Sheets (synchronisation)</h3>
@@ -591,21 +594,21 @@ async function download(name, content, type) {
   return true;
 }
 const stamp = () => fmtD(nowISO()).replace(/-/g, '') + '-' + fmtT(nowISO()).replace(':', '');
-const H_RESULTS = ['ID', 'ID tournée', 'École', 'Date', 'Heure', 'Section', 'Élément', 'Tâche', 'Statut', 'Note', 'Photos', 'Employé', 'Modifié le'];
-const H_ROUNDS = ['ID', 'École', 'Employé', 'Début', 'Fin', 'Durée (min)', 'Tâches cochées', 'Fait', 'Corrigé', 'À suivre', 'N/A', 'Notes', 'Modifié le'];
-const H_ISSUES = ['ID', 'École', 'Élément / tâche', 'Ouvert le', 'Statut', 'Description', 'Fermé le', 'Note de fermeture', 'ID tournée', 'Photos', 'Modifié le'];
+const H_RESULTS = ['ID', 'ID tournée', 'École', 'Date', 'Heure', 'Section', 'Élément', 'Tâche', 'Statut', 'Note', 'Photos', 'Employé', 'Modifié le', 'BâtimentID'];
+const H_ROUNDS = ['ID', 'École', 'Employé', 'Début', 'Fin', 'Durée (min)', 'Tâches cochées', 'Fait', 'Corrigé', 'À suivre', 'N/A', 'Notes', 'Modifié le', 'BâtimentID'];
+const H_ISSUES = ['ID', 'École', 'Élément / tâche', 'Ouvert le', 'Statut', 'Description', 'Fermé le', 'Note de fermeture', 'ID tournée', 'Photos', 'Modifié le', 'BâtimentID'];
 const H_LOG = ['ID', 'Horodatage', 'Type', 'École', 'Détail', 'Appareil', 'ID tournée'];
 const ISSUE_ST = { open: 'Ouvert', closed: 'Réglé', cancelled: 'Annulé' };
 function resultRows(r) {
   return Object.entries(r.results).map(([tid, x]) => [r.id + '|' + tid, r.id, bName(r.buildingId), fmtD(x.at), fmtT(x.at), x.section, x.item, x.task,
-    x.status ? STATUS[x.status].label : '(retiré)', x.note || '', (x.photos || []).map(p => (x.photoUrls || {})[p] || '(photo locale)').join(' '), r.worker || '', fmtDT(r.updatedAt || nowISO())]);
+    x.status ? STATUS[x.status].label : '(retiré)', x.note || '', (x.photos || []).map(p => (x.photoUrls || {})[p] || '(photo locale)').join(' '), r.worker || '', fmtDT(r.updatedAt || nowISO()), (S.buildings.find(b => b.id === r.buildingId) || {}).extId || '']);
 }
 function roundRow(r) {
   const c = roundCounts(r);
-  return [r.id, bName(r.buildingId), r.worker || '', fmtDT(r.startedAt), r.endedAt ? fmtDT(r.endedAt) : '', r.endedAt ? minutesBetween(r.startedAt, r.endedAt) : '', c.done, c.ok, c.fixed, c.todo, c.na, r.notes || '', fmtDT(r.updatedAt || nowISO())];
+  return [r.id, bName(r.buildingId), r.worker || '', fmtDT(r.startedAt), r.endedAt ? fmtDT(r.endedAt) : '', r.endedAt ? minutesBetween(r.startedAt, r.endedAt) : '', c.done, c.ok, c.fixed, c.todo, c.na, r.notes || '', fmtDT(r.updatedAt || nowISO()), (S.buildings.find(b => b.id === r.buildingId) || {}).extId || ''];
 }
 function issueRow(i) {
-  return [i.id, bName(i.buildingId), i.label, fmtDT(i.createdAt), ISSUE_ST[i.status] || i.status, i.note || '', i.closedAt ? fmtDT(i.closedAt) : '', i.closeNote || '', i.roundId || '', (i.photos || []).map(p => (i.photoUrls || {})[p] || '(photo locale)').join(' '), fmtDT(i.updatedAt || nowISO())];
+  return [i.id, bName(i.buildingId), i.label, fmtDT(i.createdAt), ISSUE_ST[i.status] || i.status, i.note || '', i.closedAt ? fmtDT(i.closedAt) : '', i.closeNote || '', i.roundId || '', (i.photos || []).map(p => (i.photoUrls || {})[p] || '(photo locale)').join(' '), fmtDT(i.updatedAt || nowISO()), (S.buildings.find(b => b.id === i.buildingId) || {}).extId || ''];
 }
 const logRow = l => [l.id, fmtDT(l.ts), l.type, l.buildingId ? bName(l.buildingId) : '', l.msg, S.settings.device || '', l.roundId || ''];
 
@@ -652,6 +655,25 @@ async function post(payload) {
     throw e;
   } finally { clearTimeout(t); }
 }
+async function importBuildings() {
+  const j = await post({ action: 'buildings' });
+  let added = 0, renamed = 0;
+  for (const rb of j.buildings || []) {
+    const key = rb.name.trim().toLowerCase();
+    let b = S.buildings.find(x => x.extId === rb.id) || S.buildings.find(x => !x.extId && x.name.trim().toLowerCase() === key);
+    if (!b) {
+      b = { id: uid(), name: rb.name, address: rb.address || '', extId: rb.id, archived: false, createdAt: nowISO() };
+      S.buildings.push(b); added++;
+      addLog('ecole.ajout', `École importée de la feuille : ${rb.name}`, { buildingId: b.id });
+    } else {
+      b.extId = rb.id; b.address = rb.address || b.address || '';
+      if (b.name !== rb.name) { addLog('ecole.renommee', `École renommée (feuille) : ${b.name} → ${rb.name}`, { buildingId: b.id }); b.name = rb.name; renamed++; }
+    }
+  }
+  await saveBuildings();
+  S.settings.subsector = j.subsector || ''; S.settings.lastBuildingsImport = nowISO(); await saveSettings();
+  return { added, renamed, total: (j.buildings || []).length, subsector: j.subsector || '' };
+}
 let syncTimer = null;
 function scheduleSync() {
   refreshPill();
@@ -688,8 +710,10 @@ async function syncNow(manual) {
       for (const [i, rev] of snap.i) if (i.rev === rev) { i.dirty = 0; await DB.put('issues', i); }
       for (const l of logs) { l.synced = 1; await DB.put('log', l); }
     }
+    let imp = null;
+    try { imp = await importBuildings(); } catch (e) { console.warn('écoles', e); }
     S.settings.lastSync = nowISO(); await saveSettings();
-    if (manual) toast('Synchronisation réussie ✓');
+    if (manual) toast('Synchronisation réussie ✓' + (imp && imp.added ? ` — ${imp.added} école(s) ajoutée(s)` : ''));
   } catch (e) {
     if (manual) toast('Synchro : ' + e.message, 5000);
     console.warn('sync', e);
@@ -773,9 +797,18 @@ const ACT = {
   restore: () => $('#importInput').click(),
   testSync: async () => {
     if (!S.settings.syncUrl) { toast('Entre l\'adresse du script.'); return; }
-    try { const j = await post({ action: 'ping' }); toast('Connexion OK ✓' + (j.sheet ? ' — ' + j.sheet : ''), 4000); } catch (e) { toast('Échec : ' + e.message, 6000); }
+    try {
+      const j = await post({ action: 'ping' });
+      const imp = await importBuildings();
+      toast(`Connexion OK ✓ — ${j.sheet || 'feuille'} · ${imp.total} école(s) ${imp.subsector}${imp.added ? `, ${imp.added} ajoutée(s)` : ''}`, 5000);
+      render();
+    } catch (e) { toast('Échec : ' + e.message, 6000); }
   },
   syncNow: () => syncNow(true),
+  importBlds: async () => {
+    if (!S.settings.syncUrl || !S.settings.syncToken) { toast('Configure d\'abord la synchro Google (Réglages).'); location.hash = '#/reglages'; return; }
+    try { const imp = await importBuildings(); toast(`${imp.total} école(s) ${imp.subsector} · ${imp.added} ajoutée(s)`, 4000); render(); } catch (e) { toast('Échec : ' + e.message, 6000); }
+  },
   checkUpdate: async () => { if (swReg) { await swReg.update(); toast(swReg.waiting ? 'Mise à jour prête.' : 'Tu as la dernière version.'); showUpdateBanner(); } else toast('Hors-ligne ou service non disponible.'); },
   // Modèle
   tplRenameTask: async b => { const f = tplFind(b.dataset.task); const v = prompt('Nom de la tâche', f.t.name); if (!v?.trim()) return; addLog('modele', `Tâche renommée : ${f.t.name} → ${v.trim()}`); f.t.name = v.trim(); await saveTemplate(); render(); },
@@ -844,7 +877,8 @@ async function registerSW() {
     swReg = await navigator.serviceWorker.register('sw.js');
     showUpdateBanner();
     swReg.addEventListener('updatefound', () => { const w = swReg.installing; w?.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) showUpdateBanner(); }); });
-    let reloaded = false;
+    // Recharger seulement lors d'une mise à jour (pas à la toute première installation).
+    let reloaded = !navigator.serviceWorker.controller;
     navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloaded) { reloaded = true; location.reload(); } });
   } catch (e) { console.warn('SW', e); }
 }
