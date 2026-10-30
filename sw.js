@@ -1,6 +1,6 @@
 /* Service worker : garde l'app en cache pour qu'elle s'ouvre sans internet.
    Change CACHE à chaque nouvelle version pour que les téléphones la reçoivent. */
-const CACHE = 'ep-v1.1.0';
+const CACHE = 'ep-v1.2.0';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'data.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png'];
 
 self.addEventListener('install', e => {

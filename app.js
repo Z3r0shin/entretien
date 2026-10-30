@@ -1,8 +1,10 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 // Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
 const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
+// Script « Entretien préventif — Synchro » (projet séparé). Le jeton secret, lui, n'est jamais dans le code.
+const DEFAULT_SYNC_URL = 'https://script.google.com/macros/s/AKfycbxZkBLDOse_oVt76mTtbrv3kzuewZw922cl1wgrre8Dbv_aYP8_MTzYT1-_P6HxvoAd/exec';
 
 // ---------- Utilitaires ----------
 const $ = (s, el = document) => el.querySelector(s);
@@ -62,7 +64,7 @@ const DB = {
 
 // ---------- État ----------
 const S = {
-  settings: { worker: '', syncUrl: '', syncToken: '', autoSync: true, lastSync: null, lastBackup: null, device: '' },
+  settings: { worker: '', syncUrl: DEFAULT_SYNC_URL, syncToken: '', autoSync: true, lastSync: null, lastBackup: null, device: '' },
   template: null, buildings: [], rounds: new Map(), issues: new Map(), log: [],
   ui: { filter: 'all', issueTab: 'open', issueBld: '', histBld: '', logBld: '', logQ: '', logLimit: 150, collapsed: {} }
 };
@@ -87,18 +89,22 @@ function flatTasks(activeOnly = true) {
   return out;
 }
 function findTask(id) { return flatTasks(false).find(x => x.task.id === id); }
-const bName = id => (S.buildings.find(b => b.id === id) || { name: '(école supprimée)' }).name;
-const activeBuildings = () => S.buildings.filter(b => !b.archived);
-const openRoundFor = bid => [...S.rounds.values()].find(r => r.buildingId === bid && !r.endedAt);
+function findBld(id) { let b = S.buildings.find(x => x.id === id), n = 0; while (b && b.mergedInto && n++ < 5) b = S.buildings.find(x => x.id === b.mergedInto) || b; return b; }
+const bName = id => (findBld(id) || { name: '(école supprimée)' }).name;
+const listedBuildings = () => S.buildings.filter(b => !b.mergedInto);
+const activeBuildings = () => S.buildings.filter(b => !b.archived && !b.mergedInto);
+const liveRounds = () => [...S.rounds.values()].filter(r => !r.deleted);
+const openRoundFor = bid => liveRounds().find(r => r.buildingId === bid && !r.endedAt);
+function touchBld(b) { b.updatedAt = nowISO(); b.dirty = 1; b.rev = (b.rev || 0) + 1; }
 
 // ---------- Persistance ----------
 const saveSettings = () => DB.put('kv', S.settings, 'settings');
-const saveTemplate = () => DB.put('kv', S.template, 'template');
+function saveTemplate() { S.template.updatedAt = nowISO(); S.template.dirty = 1; S.template.rev = (S.template.rev || 0) + 1; scheduleSync(); return DB.put('kv', S.template, 'template'); }
 const saveBuildings = () => DB.put('kv', S.buildings, 'buildings');
 function saveRound(r) { r.rev = (r.rev || 0) + 1; r.dirty = 1; r.updatedAt = nowISO(); S.rounds.set(r.id, r); scheduleSync(); return DB.put('rounds', r); }
 function saveIssue(i) { i.rev = (i.rev || 0) + 1; i.dirty = 1; i.updatedAt = nowISO(); S.issues.set(i.id, i); scheduleSync(); return DB.put('issues', i); }
 function addLog(type, msg, ctx = {}) {
-  const e = { id: uid(), ts: nowISO(), type, msg, buildingId: ctx.buildingId || '', roundId: ctx.roundId || '', taskId: ctx.taskId || '', issueId: ctx.issueId || '', synced: 0 };
+  const e = { id: uid(), ts: nowISO(), type, msg, buildingId: ctx.buildingId || '', roundId: ctx.roundId || '', taskId: ctx.taskId || '', issueId: ctx.issueId || '', device: S.settings.device || '', synced: 0 };
   S.log.push(e);
   DB.put('log', e);
   scheduleSync();
@@ -108,7 +114,7 @@ function addLog(type, msg, ctx = {}) {
 // ---------- Calculs ----------
 function lastDoneMap(bid, excludeRoundId = "") {
   const m = {};
-  for (const r of S.rounds.values()) {
+  for (const r of liveRounds()) {
     if (r.buildingId !== bid || r.id === excludeRoundId) continue;
     for (const [tid, res] of Object.entries(r.results)) {
       if (!res.status) continue;
@@ -142,6 +148,7 @@ function pendingCount() {
   let n = S.log.filter(l => !l.synced).length;
   for (const r of S.rounds.values()) if (r.dirty) n++;
   for (const i of S.issues.values()) if (i.dirty) n++;
+  n += S.buildings.filter(b => b.dirty).length + (S.template?.dirty ? 1 : 0);
   return n;
 }
 function topBar(title, { back = '', sub = '', right = '' } = {}) {
@@ -179,6 +186,8 @@ function viewHome() {
   let h = topBar('Entretien préventif', { sub: `${esc(today)}${S.settings.worker ? ' · ' + esc(S.settings.worker) : ''}`, right: `<span id="syncpill">${syncPill()}</span>` });
   if (deferredInstall) h += `<div class="card"><b>Installer l'app sur ce téléphone</b><p class="muted">Elle s'ouvrira comme une vraie app et marchera sans internet.</p><button class="btn primary" data-act="install">Installer</button></div>`;
   if (!S.settings.worker) h += `<div class="card"><label class="field"><span>Ton nom (apparaît dans les rapports et le journal)</span><input type="text" id="workerName" placeholder="Prénom Nom"></label><button class="btn primary" data-act="saveWorker">Enregistrer</button></div>`;
+  if (S.settings.syncUrl && !S.settings.syncToken) h += `<div class="card"><b>Active la synchro</b><p class="muted">Entre le jeton secret une fois sur cet appareil : tes écoles arrivent, et le cell et le PC partagent les mêmes fiches.</p>
+    <label class="field"><span>Jeton secret</span><input type="password" id="tokenInput" autocomplete="off"></label><button class="btn primary" data-act="saveToken">Activer</button></div>`;
   const blds = activeBuildings();
   if (!blds.length) {
     h += `<div class="card"><h3>Ajoute tes écoles</h3><p class="muted">Une tournée est toujours liée à un bâtiment.</p>
@@ -193,7 +202,7 @@ function viewHome() {
     const last = lastDoneMap(b.id);
     const due = tasks.filter(x => isDue(x.task, last[x.task.id])).length;
     const open = [...S.issues.values()].filter(i => i.buildingId === b.id && i.status === 'open').length;
-    const rounds = [...S.rounds.values()].filter(r => r.buildingId === b.id).sort((a, z) => z.startedAt.localeCompare(a.startedAt));
+    const rounds = liveRounds().filter(r => r.buildingId === b.id).sort((a, z) => z.startedAt.localeCompare(a.startedAt));
     const cur = rounds.find(r => !r.endedAt);
     const lastR = rounds.find(r => r.endedAt);
     h += `<div class="card"><div class="head"><div><h3>${esc(b.name)}</h3>
@@ -212,7 +221,7 @@ function viewHome() {
 // ---------- Vue : Tournée ----------
 function viewRound(id) {
   const r = S.rounds.get(id);
-  if (!r) return topBar('Tournée introuvable', { back: '#/' }) + '<p class="empty">Cette tournée n\'existe pas.</p>';
+  if (!r || r.deleted) return topBar('Tournée introuvable', { back: '#/' }) + '<p class="empty">Cette tournée n\'existe pas.</p>';
   const tasks = flatTasks();
   const last = lastDoneMap(r.buildingId, r.id);
   const c = roundCounts(r);
@@ -281,7 +290,7 @@ function refreshTaskRow(r, taskId) {
 async function startRound(bid) {
   const ex = openRoundFor(bid);
   if (ex) { location.hash = '#/tournee/' + ex.id; return; }
-  const r = { id: uid(), buildingId: bid, worker: S.settings.worker || '', startedAt: nowISO(), endedAt: null, results: {}, notes: '' };
+  const r = { id: uid(), buildingId: bid, worker: S.settings.worker || '', startedAt: nowISO(), metaMt: nowISO(), endedAt: null, results: {}, notes: '' };
   await saveRound(r);
   addLog('tournee.debut', `Début de tournée — ${bName(bid)}`, { buildingId: bid, roundId: r.id });
   S.ui.filter = 'all';
@@ -294,11 +303,11 @@ async function setStatus(rid, tid, st) {
   const cur = r.results[tid];
   const ctx = { buildingId: r.buildingId, roundId: r.id, taskId: tid };
   if (cur && cur.status === st) {
-    cur.status = null; cur.at = nowISO();
+    cur.status = null; cur.at = nowISO(); cur.mt = cur.at;
     addLog('tache.annulee', `${label} : statut retiré`, ctx);
     await dropAutoIssue(cur, ctx, label);
   } else {
-    const res = Object.assign(cur || {}, { status: st, at: nowISO(), section: ft.sec.name, item: ft.item.name, task: ft.task.name });
+    const res = Object.assign(cur || {}, { status: st, at: nowISO(), mt: nowISO(), section: ft.sec.name, item: ft.item.name, task: ft.task.name });
     r.results[tid] = res;
     addLog('tache.statut', `${label} : ${STATUS[st].label}`, ctx);
     if (st === 'todo' && !res.issueId) {
@@ -329,7 +338,7 @@ function openTaskSheet(rid, tid, hint = '') {
   const r = S.rounds.get(rid); const ft = findTask(tid); if (!r || !ft) return;
   const res = r.results[tid] || {};
   const src = window.EP_DATA.sources[ft.task.src];
-  const hist = [...S.rounds.values()].filter(o => o.buildingId === r.buildingId && o.id !== r.id && o.results[tid]?.status)
+  const hist = liveRounds().filter(o => o.buildingId === r.buildingId && o.id !== r.id && o.results[tid]?.status)
     .map(o => o.results[tid]).sort((a, z) => z.at.localeCompare(a.at)).slice(0, 5);
   openSheet(`<h3>${esc(ft.item.name)} › ${esc(ft.task.name)}</h3>
     <p class="muted" style="margin:4px 0 10px">${esc(ft.sec.name)} · ${esc(freqLabel(ft.task.freq))}${res.status ? ` · <span class="stamp ${res.status}">${STATUS[res.status].label} à ${fmtDT(res.at)}</span>` : ''}</p>
@@ -345,7 +354,7 @@ async function saveTaskNote(rid, tid, val) {
   const r = S.rounds.get(rid); const ft = findTask(tid); if (!r || !ft) return;
   const res = r.results[tid] || (r.results[tid] = { status: null, at: nowISO(), section: ft.sec.name, item: ft.item.name, task: ft.task.name });
   if ((res.note || '') === val) return;
-  res.note = val; res.noteAt = nowISO();
+  res.note = val; res.noteAt = nowISO(); res.mt = res.noteAt;
   addLog('tache.note', `${ft.item.name} › ${ft.task.name} : note « ${val.slice(0, 80)}${val.length > 80 ? '…' : ''} »`, { buildingId: r.buildingId, roundId: rid, taskId: tid });
   if (res.issueId) { const i = S.issues.get(res.issueId); if (i && i.status === 'open') { i.note = val; await saveIssue(i); } }
   await saveRound(r);
@@ -376,7 +385,7 @@ async function onPhotoPicked(file) {
     if (photoCtx.type === 'round') {
       const r = S.rounds.get(photoCtx.id); const ft = findTask(photoCtx.taskId);
       const res = r.results[photoCtx.taskId] || (r.results[photoCtx.taskId] = { status: null, at: nowISO(), section: ft.sec.name, item: ft.item.name, task: ft.task.name });
-      (res.photos ||= []).push(p.id);
+      (res.photos ||= []).push(p.id); res.mt = nowISO();
       addLog('photo', `Photo ajoutée : ${ft.item.name} › ${ft.task.name}`, { buildingId: r.buildingId, roundId: r.id, taskId: photoCtx.taskId });
       if (res.issueId) { const i = S.issues.get(res.issueId); if (i) { (i.photos ||= []).push(p.id); await saveIssue(i); } }
       await saveRound(r);
@@ -397,7 +406,12 @@ async function fillPhotos(root) {
   for (const img of $$('img[data-photo]', root)) {
     if (img.src) continue;
     const p = await DB.get('photos', img.dataset.photo);
-    if (p) img.src = p.data; else img.alt = 'Photo absente';
+    if (p && p.data) img.src = p.data;
+    else if (p && p.fileId) {
+      img.onerror = () => { const a = document.createElement('a'); a.href = p.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = '📷 Voir sur Drive'; a.className = 'pill'; img.replaceWith(a); };
+      img.src = `https://drive.google.com/thumbnail?id=${encodeURIComponent(p.fileId)}&sz=w400`;
+    } else if (p && p.url) { const a = document.createElement('a'); a.href = p.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = '📷 Voir sur Drive'; a.className = 'pill'; img.replaceWith(a); }
+    else img.alt = 'Photo pas encore reçue';
   }
 }
 
@@ -421,7 +435,7 @@ function viewIssues() {
   return h;
 }
 function bldSelect(key, val) {
-  return `<label class="field"><span>École</span><select data-change="uiSel" data-key="${key}"><option value="">Toutes</option>${S.buildings.map(b => `<option value="${b.id}" ${b.id === val ? 'selected' : ''}>${esc(b.name)}${b.archived ? ' (archivée)' : ''}</option>`).join('')}</select></label>`;
+  return `<label class="field"><span>École</span><select data-change="uiSel" data-key="${key}"><option value="">Toutes</option>${listedBuildings().map(b => `<option value="${b.id}" ${b.id === val ? 'selected' : ''}>${esc(b.name)}${b.archived ? ' (archivée)' : ''}</option>`).join('')}</select></label>`;
 }
 function openIssueSheet(id) {
   const i = S.issues.get(id); if (!i) return;
@@ -446,7 +460,7 @@ function newIssueSheet(bid) {
 // ---------- Vue : Historique / Rapport / Matrice ----------
 function viewHistory() {
   const fb = S.ui.histBld;
-  const list = [...S.rounds.values()].filter(r => !fb || r.buildingId === fb).sort((a, z) => z.startedAt.localeCompare(a.startedAt));
+  const list = liveRounds().filter(r => !fb || r.buildingId === fb).sort((a, z) => z.startedAt.localeCompare(a.startedAt));
   let h = topBar('Historique', { sub: `${list.length} tournée${list.length > 1 ? 's' : ''}` });
   h += `<div class="actions" style="margin-top:12px"><button class="btn" data-act="go" data-to="#/matrice">Tableau par école</button><button class="btn" data-act="exportResults">Exporter résultats (CSV)</button></div>`;
   h += bldSelect('histBld', fb);
@@ -461,7 +475,7 @@ function viewHistory() {
 }
 function viewReport(id) {
   const r = S.rounds.get(id);
-  if (!r) return topBar('Rapport', { back: '#/historique' }) + '<p class="empty">Introuvable.</p>';
+  if (!r || r.deleted) return topBar('Rapport', { back: '#/historique' }) + '<p class="empty">Introuvable.</p>';
   const c = roundCounts(r);
   let h = topBar('Rapport de tournée', { back: '#/historique', sub: esc(bName(r.buildingId)) });
   h += `<div class="card"><p class="print-only"><b>Entretien préventif — rapport de tournée</b></p>
@@ -510,7 +524,7 @@ function viewMatrix() {
 // ---------- Vue : Journal ----------
 function viewLog() {
   const fb = S.ui.logBld, q = S.ui.logQ.toLowerCase();
-  const list = S.log.filter(l => (!fb || l.buildingId === fb) && (!q || l.msg.toLowerCase().includes(q))).sort((a, z) => z.ts.localeCompare(a.ts));
+  const list = S.log.filter(l => (!fb || (findBld(l.buildingId) || {}).id === fb) && (!q || l.msg.toLowerCase().includes(q))).sort((a, z) => z.ts.localeCompare(a.ts));
   let h = topBar('Journal', { sub: `${S.log.length} entrées horodatées` });
   h += bldSelect('logBld', fb);
   h += `<label class="field"><span>Rechercher</span><input type="search" data-input="logQ" value="${esc(S.ui.logQ)}" placeholder="ex. extincteur"></label>`;
@@ -526,7 +540,7 @@ function viewSettings() {
   let h = topBar('Réglages', { sub: `Version ${APP_VERSION}` });
   h += `<div class="card"><h3>Employé</h3><label class="field"><span>Nom</span><input type="text" data-change="setting" data-key="worker" value="${esc(st.worker)}"></label>
     <label class="field"><span>Nom de cet appareil (optionnel)</span><input type="text" data-change="setting" data-key="device" value="${esc(st.device)}" placeholder="ex. Cell de Guillaume"></label></div>`;
-  h += `<div class="card"><h3>Écoles / bâtiments</h3><ul class="list">${S.buildings.map(b => `<li class="switch"><span>${esc(b.name)}${b.archived ? ' <span class="pill off">archivée</span>' : ''}</span>
+  h += `<div class="card"><h3>Écoles / bâtiments</h3><ul class="list">${listedBuildings().map(b => `<li class="switch"><span>${esc(b.name)}${b.archived ? ' <span class="pill off">archivée</span>' : ''}</span>
       <span class="actions"><button class="btn small" data-act="renameBld" data-id="${b.id}">Renommer</button><button class="btn small" data-act="archiveBld" data-id="${b.id}">${b.archived ? 'Réactiver' : 'Archiver'}</button></span></li>`).join('') || '<li class="muted">Aucune.</li>'}</ul>
     <label class="field"><span>Ajouter</span><input type="text" id="newBld" placeholder="Nom de l'école"></label><span class="actions"><button class="btn" data-act="addBuilding">Ajouter</button><button class="btn" data-act="importBlds">Importer de la feuille Google</button></span>
     ${S.settings.lastBuildingsImport ? `<p class="muted">Dernier import : ${fmtDT(S.settings.lastBuildingsImport)}${S.settings.subsector ? ' · ' + esc(S.settings.subsector) : ''}</p>` : ''}</div>`;
@@ -601,16 +615,16 @@ const H_LOG = ['ID', 'Horodatage', 'Type', 'École', 'Détail', 'Appareil', 'ID 
 const ISSUE_ST = { open: 'Ouvert', closed: 'Réglé', cancelled: 'Annulé' };
 function resultRows(r) {
   return Object.entries(r.results).map(([tid, x]) => [r.id + '|' + tid, r.id, bName(r.buildingId), fmtD(x.at), fmtT(x.at), x.section, x.item, x.task,
-    x.status ? STATUS[x.status].label : '(retiré)', x.note || '', (x.photos || []).map(p => (x.photoUrls || {})[p] || '(photo locale)').join(' '), r.worker || '', fmtDT(r.updatedAt || nowISO()), (S.buildings.find(b => b.id === r.buildingId) || {}).extId || '']);
+    r.deleted ? '(tournée supprimée)' : x.status ? STATUS[x.status].label : '(retiré)', x.note || '', (x.photos || []).map(p => (x.photoUrls || {})[p] || '(photo locale)').join(' '), r.worker || '', fmtDT(r.updatedAt || nowISO()), (S.buildings.find(b => b.id === r.buildingId) || {}).extId || '']);
 }
 function roundRow(r) {
   const c = roundCounts(r);
-  return [r.id, bName(r.buildingId), r.worker || '', fmtDT(r.startedAt), r.endedAt ? fmtDT(r.endedAt) : '', r.endedAt ? minutesBetween(r.startedAt, r.endedAt) : '', c.done, c.ok, c.fixed, c.todo, c.na, r.notes || '', fmtDT(r.updatedAt || nowISO()), (S.buildings.find(b => b.id === r.buildingId) || {}).extId || ''];
+  return [r.id, bName(r.buildingId), r.worker || '', fmtDT(r.startedAt), r.endedAt ? fmtDT(r.endedAt) : '', r.endedAt ? minutesBetween(r.startedAt, r.endedAt) : '', c.done, c.ok, c.fixed, c.todo, c.na, (r.deleted ? '[SUPPRIMÉE] ' : '') + (r.notes || ''), fmtDT(r.updatedAt || nowISO()), (S.buildings.find(b => b.id === r.buildingId) || {}).extId || ''];
 }
 function issueRow(i) {
   return [i.id, bName(i.buildingId), i.label, fmtDT(i.createdAt), ISSUE_ST[i.status] || i.status, i.note || '', i.closedAt ? fmtDT(i.closedAt) : '', i.closeNote || '', i.roundId || '', (i.photos || []).map(p => (i.photoUrls || {})[p] || '(photo locale)').join(' '), fmtDT(i.updatedAt || nowISO()), (S.buildings.find(b => b.id === i.buildingId) || {}).extId || ''];
 }
-const logRow = l => [l.id, fmtDT(l.ts), l.type, l.buildingId ? bName(l.buildingId) : '', l.msg, S.settings.device || '', l.roundId || ''];
+const logRow = l => [l.id, fmtDT(l.ts), l.type, l.buildingId ? bName(l.buildingId) : '', l.msg, l.device || '', l.roundId || ''];
 
 async function backup() {
   const photos = await DB.all('photos');
@@ -633,7 +647,12 @@ async function restore(file) {
   for (const r of data.rounds || []) { S.rounds.set(r.id, r); await DB.put('rounds', r); }
   for (const i of data.issues || []) { S.issues.set(i.id, i); await DB.put('issues', i); }
   for (const l of data.log || []) { S.log.push(l); await DB.put('log', l); }
-  for (const p of data.photos || []) await DB.put('photos', p);
+  for (const p of data.photos || []) await DB.put('photos', { ...p, docDirty: p.url ? 1 : 0 });
+  for (const r of S.rounds.values()) { r.dirty = 1; await DB.put('rounds', r); }
+  for (const i of S.issues.values()) { i.dirty = 1; await DB.put('issues', i); }
+  for (const l of S.log) { l.synced = 0; await DB.put('log', l); }
+  for (const b of S.buildings) b.dirty = 1;
+  await saveBuildings(); S.settings.pullSeq = 0; await saveSettings();
   addLog('restauration', `Données restaurées depuis la sauvegarde du ${fmtDT(data.exportedAt)}`);
   toast('Restauration terminée.'); location.hash = '#/'; render();
 }
@@ -655,71 +674,210 @@ async function post(payload) {
     throw e;
   } finally { clearTimeout(t); }
 }
+// ---------- Fiches partagées : synchro dans les deux sens ----------
+// Chaque appareil envoie ses fiches modifiées et reçoit celles des autres.
+// Règle de fusion : par tâche (et par fiche), la modification la plus récente gagne.
+function canon(v) {
+  if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
+  return JSON.stringify(v === undefined ? null : v);
+}
+const LOCAL_KEYS = ['dirty', 'rev', 'synced', 'data', 'uploaded', 'docDirty', 'srvSeq'];
+function strip(o) { const c = { ...o }; for (const k of LOCAL_KEYS) delete c[k]; return c; }
+const sameDoc = (a, b) => canon(strip(a)) === canon(strip(b));
+const resMt = x => (x ? x.mt || [x.at, x.noteAt].filter(Boolean).sort().pop() || '' : '');
+const maxStr = (a, b) => ((a || '') > (b || '') ? a || '' : b || '');
+function mergePhotos(target, a, b) {
+  const ph = [...new Set([...(a.photos || []), ...(b.photos || [])])];
+  const urls = { ...(a.photoUrls || {}), ...(b.photoUrls || {}) };
+  if (ph.length) target.photos = ph; else delete target.photos;
+  if (Object.keys(urls).length) target.photoUrls = urls; else delete target.photoUrls;
+  return target;
+}
+function mergeRound(l, r) {
+  if (!l) return { ...r };
+  const m = { ...l };
+  if ((r.metaMt || r.startedAt || '') > (l.metaMt || l.startedAt || '')) for (const k of ['notes', 'endedAt', 'deleted', 'worker', 'metaMt', 'buildingId']) m[k] = r[k];
+  m.results = {};
+  for (const tid of new Set([...Object.keys(l.results || {}), ...Object.keys(r.results || {})])) {
+    const a = (l.results || {})[tid], b = (r.results || {})[tid];
+    if (!a || !b) { m.results[tid] = { ...(a || b) }; continue; }
+    m.results[tid] = mergePhotos({ ...(resMt(b) > resMt(a) ? b : a) }, a, b);
+  }
+  m.updatedAt = maxStr(l.updatedAt, r.updatedAt);
+  return m;
+}
+function mergeIssue(l, r) {
+  if (!l) return { ...r };
+  return mergePhotos({ ...((r.updatedAt || '') > (l.updatedAt || '') ? r : l) }, l, r);
+}
+const newerOf = (l, r) => (!l || (r.updatedAt || '') > (l.updatedAt || '') ? { ...r } : { ...l });
+
+async function applyDoc(d) {
+  let remote;
+  try { remote = JSON.parse(d.json); } catch (e) { return false; }
+  const seq = Number(d.seq) || 0;
+  // Fusionne avec la fiche locale. srvSeq = version du serveur que cette fiche a vue.
+  // Reste « à envoyer » seulement si la fusion contient quelque chose que le serveur n'a pas.
+  const settle = (l, m) => {
+    if (l && sameDoc(l, m)) { const was = l.dirty; l.srvSeq = seq; if (l.dirty && sameDoc(l, remote)) l.dirty = 0; return { obj: l, changed: false, touched: true, was }; }
+    m.srvSeq = seq; m.rev = (l?.rev || 0) + 1; m.dirty = sameDoc(m, remote) ? 0 : 1;
+    return { obj: m, changed: true, touched: true };
+  };
+  if (d.type === 'round' || d.type === 'issue') {
+    const map = d.type === 'round' ? S.rounds : S.issues, store = d.type === 'round' ? 'rounds' : 'issues';
+    const l = map.get(remote.id);
+    const r = settle(l, (d.type === 'round' ? mergeRound : mergeIssue)(l && strip(l), remote));
+    map.set(r.obj.id, r.obj); await DB.put(store, r.obj);
+    return r.changed;
+  }
+  if (d.type === 'log') {
+    if (S.log.some(x => x.id === remote.id)) return false;
+    const e = { ...remote, synced: 1 }; S.log.push(e); await DB.put('log', e);
+    return true;
+  }
+  if (d.type === 'building') {
+    const i = S.buildings.findIndex(x => x.id === remote.id), l = S.buildings[i];
+    const r = settle(l, newerOf(l && strip(l), remote));
+    if (i >= 0) S.buildings[i] = r.obj; else S.buildings.push(r.obj);
+    await saveBuildings();
+    return r.changed;
+  }
+  if (d.type === 'template') {
+    const r = settle(S.template, newerOf(S.template && strip(S.template), remote));
+    S.template = r.obj; await DB.put('kv', S.template, 'template');
+    return r.changed;
+  }
+  if (d.type === 'photo') {
+    const l = await DB.get('photos', remote.id);
+    if (l && (l.fileId || l.data)) { if (l.srvSeq !== seq) { l.srvSeq = seq; await DB.put('photos', l); } return false; }
+    await DB.put('photos', { ...(l || {}), ...remote, uploaded: 1, docDirty: 0, srvSeq: seq });
+    return true;
+  }
+  return false;
+}
+// Fiches à envoyer. « base » = la version du serveur sur laquelle repose la modification.
+function collectDocs(photoDocs) {
+  const docs = [], snap = [];
+  const add = (type, id, mt, obj, base) => { docs.push({ id: type + ':' + id, type, mt: mt || '', base: base || 0, json: JSON.stringify(strip(obj)) }); return type + ':' + id; };
+  for (const r of S.rounds.values()) if (r.dirty) snap.push([add('round', r.id, r.updatedAt, r, r.srvSeq), r, r.rev, 'rounds']);
+  for (const i of S.issues.values()) if (i.dirty) snap.push([add('issue', i.id, i.updatedAt, i, i.srvSeq), i, i.rev, 'issues']);
+  for (const b of S.buildings) if (b.dirty) snap.push([add('building', b.id, b.updatedAt, b, b.srvSeq), b, b.rev, 'buildings']);
+  if (S.template.dirty) snap.push([add('template', 'main', S.template.updatedAt, S.template, S.template.srvSeq), S.template, S.template.rev, 'template']);
+  for (const l of S.log) if (!l.synced) snap.push([add('log', l.id, l.ts, l, 0), l, 0, 'log']);
+  for (const p of photoDocs) snap.push([add('photo', p.id, p.at, { id: p.id, at: p.at, ref: p.ref, url: p.url, fileId: p.fileId }, p.srvSeq), p, 0, 'photos']);
+  return { docs, snap };
+}
+
 async function importBuildings() {
   const j = await post({ action: 'buildings' });
   let added = 0, renamed = 0;
   for (const rb of j.buildings || []) {
-    const key = rb.name.trim().toLowerCase();
-    let b = S.buildings.find(x => x.extId === rb.id) || S.buildings.find(x => !x.extId && x.name.trim().toLowerCase() === key);
+    const want = 'ext-' + rb.id, key = rb.name.trim().toLowerCase();
+    let b = S.buildings.find(x => x.id === want)
+      || S.buildings.find(x => x.extId === rb.id && !x.mergedInto)
+      || S.buildings.find(x => !x.extId && !x.mergedInto && x.name.trim().toLowerCase() === key);
     if (!b) {
-      b = { id: uid(), name: rb.name, address: rb.address || '', extId: rb.id, archived: false, createdAt: nowISO() };
-      S.buildings.push(b); added++;
+      b = { id: want, name: rb.name, address: rb.address || '', extId: rb.id, archived: false, createdAt: nowISO() };
+      touchBld(b); S.buildings.push(b); added++;
       addLog('ecole.ajout', `École importée de la feuille : ${rb.name}`, { buildingId: b.id });
-    } else {
-      b.extId = rb.id; b.address = rb.address || b.address || '';
-      if (b.name !== rb.name) { addLog('ecole.renommee', `École renommée (feuille) : ${b.name} → ${rb.name}`, { buildingId: b.id }); b.name = rb.name; renamed++; }
+      continue;
     }
+    if (b.id !== want) b = await remapBuilding(b, want, rb.id);
+    let ch = false;
+    if (b.extId !== rb.id) { b.extId = rb.id; ch = true; }
+    if (rb.address && b.address !== rb.address) { b.address = rb.address; ch = true; }
+    if (b.name !== rb.name) { addLog('ecole.renommee', `École renommée (feuille) : ${b.name} → ${rb.name}`, { buildingId: b.id }); b.name = rb.name; renamed++; ch = true; }
+    if (ch) touchBld(b);
   }
   await saveBuildings();
   S.settings.subsector = j.subsector || ''; S.settings.lastBuildingsImport = nowISO(); await saveSettings();
   return { added, renamed, total: (j.buildings || []).length, subsector: j.subsector || '' };
 }
+// Une école liée à la feuille prend l'ID stable « ext-<ID feuille> » : tous les appareils parlent ainsi de la même école.
+async function remapBuilding(old, newId, extId) {
+  let nb = S.buildings.find(x => x.id === newId);
+  if (!nb) { nb = { ...old, id: newId, extId }; delete nb.mergedInto; nb.archived = false; touchBld(nb); S.buildings.push(nb); }
+  old.mergedInto = newId; old.archived = true; touchBld(old);
+  for (const r of [...S.rounds.values()]) if (r.buildingId === old.id) { r.buildingId = newId; r.metaMt = nowISO(); await saveRound(r); }
+  for (const i of [...S.issues.values()]) if (i.buildingId === old.id) { i.buildingId = newId; await saveIssue(i); }
+  return nb;
+}
+
 let syncTimer = null;
-function scheduleSync() {
+function scheduleSync(delay = 20000) {
   refreshPill();
   if (!S.settings.autoSync || !S.settings.syncUrl) return;
-  clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow(false), 20000);
+  clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow(false), delay);
+}
+// Re-dessine l'écran après réception, sauf si l'utilisateur est en train d'écrire.
+function softRender() {
+  if ($('#sheet').open) return;
+  const a = document.activeElement;
+  if (a && /^(TEXTAREA|INPUT|SELECT)$/.test(a.tagName)) return;
+  const y = window.scrollY; render(); window.scrollTo(0, y);
 }
 async function syncNow(manual) {
   if (!S.settings.syncUrl || !S.settings.syncToken) { if (manual) toast('Entre l\'adresse du script et le jeton dans Réglages.'); return; }
-  if (!navigator.onLine) { if (manual) toast('Pas d\'internet : les données attendent dans le téléphone.'); return; }
+  if (!navigator.onLine) { if (manual) toast('Pas d\'internet : les données attendent dans l\'appareil.'); return; }
   if (syncing) return;
   syncing = true; refreshPill();
+  let received = 0, ok = false;
   try {
-    // 1) Photos non envoyées
-    const photos = (await DB.all('photos')).filter(p => !p.uploaded);
-    for (const p of photos) {
+    // 1) Photos pas encore envoyées
+    const photos = await DB.all('photos');
+    for (const p of photos.filter(x => !x.uploaded && x.data)) {
       const ref = p.ref || {};
       const owner = ref.type === 'round' ? S.rounds.get(ref.id) : S.issues.get(ref.id);
-      const bid = owner ? owner.buildingId : '';
-      const j = await post({ action: 'photo', id: p.id, folder: bName(bid), filename: `${fmtD(p.at)}_${fmtT(p.at).replace(':', 'h')}_${p.id}.jpg`, data: p.data.split(',')[1] });
-      p.uploaded = 1; p.url = j.url; await DB.put('photos', p);
+      const j = await post({ action: 'photo', id: p.id, folder: bName(owner ? owner.buildingId : ''), filename: `${fmtD(p.at)}_${fmtT(p.at).replace(':', 'h')}_${p.id}.jpg`, data: p.data.split(',')[1] });
+      p.uploaded = 1; p.url = j.url; p.fileId = j.fileId || ''; p.docDirty = 1; await DB.put('photos', p);
       if (owner && ref.type === 'round') { const res = owner.results[ref.taskId]; if (res) { (res.photoUrls ||= {})[p.id] = j.url; await saveRound(owner); } }
       for (const i of S.issues.values()) if (i.photos?.includes(p.id)) { (i.photoUrls ||= {})[p.id] = j.url; await saveIssue(i); }
     }
-    // 2) Données
-    const rounds = [...S.rounds.values()].filter(r => r.dirty), issues = [...S.issues.values()].filter(i => i.dirty), logs = S.log.filter(l => !l.synced);
-    if (rounds.length || issues.length || logs.length) {
-      const snap = { r: rounds.map(r => [r, r.rev]), i: issues.map(i => [i, i.rev]) };
-      await post({ action: 'sync', device: S.settings.device || '', tables: [
+    // 2) Envoi des fiches modifiées + réception de celles des autres appareils
+    // Jusqu'à 3 passes : une fiche refusée (un autre appareil l'a modifiée entre-temps)
+    // revient fusionnée, puis repart à la passe suivante.
+    for (let pass = 0; pass < 3; pass++) {
+      const photoDocs = (await DB.all('photos')).filter(p => p.docDirty && (p.fileId || p.url));
+      const { docs, snap } = collectDocs(photoDocs);
+      if (pass > 0 && !docs.length) break;
+      const rounds = [...S.rounds.values()].filter(r => r.dirty), issues = [...S.issues.values()].filter(i => i.dirty), logs = S.log.filter(l => !l.synced);
+      let res = await post({ action: 'sync', device: S.settings.device || '', since: S.settings.pullSeq || 0, docs, tables: [
         { name: 'Tournées', headers: H_ROUNDS, rows: rounds.map(roundRow) },
         { name: 'Résultats', headers: H_RESULTS, rows: rounds.flatMap(resultRows) },
         { name: 'Suivis', headers: H_ISSUES, rows: issues.map(issueRow) },
         { name: 'Journal', headers: H_LOG, rows: logs.map(logRow) }] });
-      for (const [r, rev] of snap.r) if (r.rev === rev) { r.dirty = 0; await DB.put('rounds', r); }
-      for (const [i, rev] of snap.i) if (i.rev === rev) { i.dirty = 0; await DB.put('issues', i); }
-      for (const l of logs) { l.synced = 1; await DB.put('log', l); }
+      const acks = res.acks || {}, rejected = res.rejected || 0;
+      for (const [key, o, rev, kind] of snap) {
+        if (acks[key] === undefined) continue;          // refusée : sera fusionnée puis renvoyée
+        if (kind === 'log') { o.synced = 1; await DB.put('log', o); continue; }
+        o.srvSeq = acks[key];
+        if (kind === 'photos') { o.docDirty = 0; await DB.put('photos', o); continue; }
+        if (o.rev === rev) o.dirty = 0;
+        if (kind === 'rounds' || kind === 'issues') await DB.put(kind, o);
+      }
+      await saveBuildings(); await DB.put('kv', S.template, 'template');
+      for (;;) {
+        for (const d of res.docs || []) if (await applyDoc(d)) received++;
+        S.settings.pullSeq = res.cursor || S.settings.pullSeq || 0; await saveSettings();
+        if (!res.more) break;
+        res = await post({ action: 'sync', device: S.settings.device || '', since: S.settings.pullSeq, docs: [], tables: [] });
+      }
+      if (!rejected) break;
     }
+    // 3) Écoles de la feuille (Pointe-aux-Trembles), après réception pour ne pas dupliquer ce qu'un autre appareil a déjà importé
     let imp = null;
     try { imp = await importBuildings(); } catch (e) { console.warn('écoles', e); }
     S.settings.lastSync = nowISO(); await saveSettings();
-    if (manual) toast('Synchronisation réussie ✓' + (imp && imp.added ? ` — ${imp.added} école(s) ajoutée(s)` : ''));
+    ok = true;
+    if (manual) toast('Synchronisation réussie ✓' + (received ? ` — ${received} changement(s) reçu(s)` : '') + (imp && imp.added ? ` — ${imp.added} école(s) ajoutée(s)` : ''), 4000);
   } catch (e) {
     if (manual) toast('Synchro : ' + e.message, 5000);
     console.warn('sync', e);
   } finally {
     syncing = false; refreshPill();
-    if (location.hash.startsWith('#/reglages') || location.hash.startsWith('#/journal')) render();
+    if (received || location.hash.startsWith('#/reglages') || location.hash.startsWith('#/journal')) softRender();
+    if (ok && pendingCount()) scheduleSync(1500);
   }
 }
 
@@ -727,18 +885,24 @@ async function syncNow(manual) {
 const ACT = {
   go: b => { location.hash = b.dataset.to; },
   install: async () => { if (!deferredInstall) return; deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; render(); },
+  saveToken: async () => {
+    const v = $('#tokenInput').value.trim(); if (!v) { toast('Entre le jeton.'); return; }
+    S.settings.syncToken = v; S.settings.autoSync = true; await saveSettings();
+    try { await post({ action: 'ping' }); } catch (e) { S.settings.syncToken = ''; await saveSettings(); toast('Échec : ' + e.message, 6000); return; }
+    toast('Synchro activée ✓'); await syncNow(true); render();
+  },
   saveWorker: async () => { const v = $('#workerName').value.trim(); if (!v) return; S.settings.worker = v; await saveSettings(); addLog('reglage', `Employé : ${v}`); render(); },
   addBuilding: async () => {
     const v = $('#newBld').value.trim(); if (!v) { toast('Entre un nom.'); return; }
     const b = { id: uid(), name: v, archived: false, createdAt: nowISO() };
-    S.buildings.push(b); await saveBuildings(); addLog('ecole.ajout', `École ajoutée : ${v}`, { buildingId: b.id }); render(); toast('École ajoutée');
+    touchBld(b); S.buildings.push(b); await saveBuildings(); addLog('ecole.ajout', `École ajoutée : ${v}`, { buildingId: b.id }); render(); toast('École ajoutée');
   },
   renameBld: async b => {
     const x = S.buildings.find(y => y.id === b.dataset.id); const v = prompt('Nouveau nom', x.name); if (!v || v.trim() === x.name) return;
-    addLog('ecole.renommee', `École renommée : ${x.name} → ${v.trim()}`, { buildingId: x.id }); x.name = v.trim(); await saveBuildings(); render();
+    addLog('ecole.renommee', `École renommée : ${x.name} → ${v.trim()}`, { buildingId: x.id }); x.name = v.trim(); touchBld(x); await saveBuildings(); render();
   },
   archiveBld: async b => {
-    const x = S.buildings.find(y => y.id === b.dataset.id); x.archived = !x.archived; await saveBuildings();
+    const x = S.buildings.find(y => y.id === b.dataset.id); x.archived = !x.archived; touchBld(x); await saveBuildings();
     addLog('ecole.archive', `École ${x.archived ? 'archivée' : 'réactivée'} : ${x.name}`, { buildingId: x.id }); render();
   },
   startRound: b => startRound(b.dataset.bld),
@@ -749,21 +913,21 @@ const ACT = {
   closeSheet: () => closeSheet(),
   addPhoto: b => { photoCtx = { type: 'round', id: b.dataset.round, taskId: b.dataset.task }; flushSheetNotes(); $('#photoInput').click(); },
   addIssuePhoto: b => { photoCtx = { type: 'issue', id: b.dataset.id }; flushSheetNotes(); $('#photoInput').click(); },
-  viewPhoto: async b => { const p = await DB.get('photos', b.dataset.id); if (p) { const w = window.open(); if (w) w.document.write(`<title>Photo</title><img src="${p.data}" style="max-width:100%">`); } },
+  viewPhoto: async b => { const p = await DB.get('photos', b.dataset.id); if (p && !p.data && p.url) { window.open(p.url, '_blank', 'noopener'); return; } if (p) { const w = window.open(); if (w) w.document.write(`<title>Photo</title><img src="${p.data}" style="max-width:100%">`); } },
   endRound: async b => {
     const r = S.rounds.get(b.dataset.round); const total = flatTasks().length, done = flatTasks().filter(x => r.results[x.task.id]?.status).length;
     if (done < total && !confirm(`${total - done} tâche(s) non cochée(s). Terminer quand même ?`)) return;
-    r.endedAt = nowISO(); await saveRound(r);
+    r.endedAt = nowISO(); r.metaMt = r.endedAt; await saveRound(r);
     addLog('tournee.fin', `Fin de tournée — ${bName(r.buildingId)} (${done}/${total} tâches, ${fmtDur(minutesBetween(r.startedAt, r.endedAt))})`, { buildingId: r.buildingId, roundId: r.id });
     if (S.settings.autoSync) syncNow(false);
     location.hash = '#/rapport/' + r.id;
   },
-  reopenRound: async b => { const r = S.rounds.get(b.dataset.round); r.endedAt = null; await saveRound(r); addLog('tournee.rouverte', `Tournée rouverte — ${bName(r.buildingId)}`, { buildingId: r.buildingId, roundId: r.id }); render(); },
+  reopenRound: async b => { const r = S.rounds.get(b.dataset.round); r.endedAt = null; r.metaMt = nowISO(); await saveRound(r); addLog('tournee.rouverte', `Tournée rouverte — ${bName(r.buildingId)}`, { buildingId: r.buildingId, roundId: r.id }); render(); },
   deleteRound: async b => {
     const r = S.rounds.get(b.dataset.round);
     if (!confirm('Supprimer cette tournée ? (Le journal garde la trace de la suppression.)')) return;
     for (const res of Object.values(r.results)) if (res.issueId) { const i = S.issues.get(res.issueId); if (i && i.status === 'open') { i.status = 'cancelled'; i.closedAt = nowISO(); i.closeNote = 'Tournée supprimée'; await saveIssue(i); } }
-    S.rounds.delete(r.id); await DB.del('rounds', r.id);
+    r.deleted = true; r.metaMt = nowISO(); await saveRound(r);
     addLog('tournee.supprimee', `Tournée supprimée — ${bName(r.buildingId)} du ${fmtDT(r.startedAt)}`, { buildingId: r.buildingId, roundId: r.id });
     location.hash = '#/';
   },
@@ -790,7 +954,7 @@ const ACT = {
   logMore: () => { S.ui.logLimit += 300; render(); },
   print: () => window.print(),
   exportRound: b => { const r = S.rounds.get(b.dataset.round); download(`tournee-${slug(bName(r.buildingId))}-${fmtD(r.startedAt)}.csv`, csv([H_RESULTS, ...resultRows(r).filter(x => x[8] !== '(retiré)')]), 'text/csv'); },
-  exportResults: () => download(`resultats-${stamp()}.csv`, csv([H_RESULTS, ...[...S.rounds.values()].sort((a, z) => a.startedAt.localeCompare(z.startedAt)).flatMap(resultRows).filter(x => x[8] !== '(retiré)')]), 'text/csv'),
+  exportResults: () => download(`resultats-${stamp()}.csv`, csv([H_RESULTS, ...liveRounds().sort((a, z) => a.startedAt.localeCompare(z.startedAt)).flatMap(resultRows).filter(x => x[8] !== '(retiré)')]), 'text/csv'),
   exportIssues: () => download(`suivis-${stamp()}.csv`, csv([H_ISSUES, ...[...S.issues.values()].map(issueRow)]), 'text/csv'),
   exportLog: () => download(`journal-${stamp()}.csv`, csv([H_LOG, ...[...S.log].sort((a, z) => a.ts.localeCompare(z.ts)).map(logRow)]), 'text/csv'),
   backup: () => backup(),
@@ -828,7 +992,7 @@ const ACT = {
   tplReset: async () => { if (!confirm('Remettre la liste d\'origine ? Tes modifications de liste seront perdues (l\'historique reste).')) return; S.template = buildTemplate(); await saveTemplate(); addLog('modele', 'Liste de tâches remise à l\'origine'); render(); }
 };
 const CHG = {
-  roundNote: async el => { const r = S.rounds.get(el.dataset.round); if ((r.notes || '') === el.value) return; r.notes = el.value; await saveRound(r); addLog('tournee.note', `Note de tournée : « ${el.value.slice(0, 80)} »`, { buildingId: r.buildingId, roundId: r.id }); },
+  roundNote: async el => { const r = S.rounds.get(el.dataset.round); if ((r.notes || '') === el.value) return; r.notes = el.value; r.metaMt = nowISO(); await saveRound(r); addLog('tournee.note', `Note de tournée : « ${el.value.slice(0, 80)} »`, { buildingId: r.buildingId, roundId: r.id }); },
   taskNote: el => saveTaskNote(el.dataset.round, el.dataset.task, el.value.trim()),
   issueNote: async el => { const i = S.issues.get(el.dataset.id); if ((i.note || '') === el.value.trim()) return; i.note = el.value.trim(); await saveIssue(i); addLog('suivi.note', `Suivi « ${i.label} » : note modifiée`, { buildingId: i.buildingId, issueId: i.id }); },
   uiSel: el => { S.ui[el.dataset.key] = el.value; render(); },
@@ -883,26 +1047,43 @@ async function registerSW() {
   } catch (e) { console.warn('SW', e); }
 }
 
+// Passage à la v1.2 : toutes les fiches existantes partent une fois vers la feuille partagée.
+async function migrateToSharedDocs(storedTemplate) {
+  for (const r of S.rounds.values()) { r.dirty = 1; await DB.put('rounds', r); }
+  for (const i of S.issues.values()) { i.dirty = 1; await DB.put('issues', i); }
+  for (const l of S.log) if (l.synced) { l.synced = 0; await DB.put('log', l); }
+  for (const b of S.buildings) { b.updatedAt ||= b.createdAt || nowISO(); b.dirty = 1; }
+  for (const b of [...S.buildings]) if (b.extId && !b.mergedInto && b.id !== 'ext-' + b.extId) await remapBuilding(b, 'ext-' + b.extId, b.extId);
+  await saveBuildings();
+  if (storedTemplate && canon(storedTemplate.sections) !== canon(buildTemplate().sections)) await saveTemplate();
+  for (const p of await DB.all('photos')) if (p.uploaded && !p.docDirty) await DB.put('photos', { ...p, docDirty: p.url ? 1 : 0 });
+  S.settings.docsV2 = true; S.settings.pullSeq = 0; await saveSettings();
+}
+
 // ---------- Démarrage ----------
 (async function init() {
   try {
     await DB.open();
     const [settings, template, buildings, rounds, issues, log] = await Promise.all([DB.get('kv', 'settings'), DB.get('kv', 'template'), DB.get('kv', 'buildings'), DB.all('rounds'), DB.all('issues'), DB.all('log')]);
     if (settings) S.settings = { ...S.settings, ...settings };
-    if ((S.settings.syncUrl || '').includes(RETIRED_SYNC_URL_PART)) { S.settings.syncUrl = ''; await saveSettings(); }
+    if (!S.settings.syncUrl || S.settings.syncUrl.includes(RETIRED_SYNC_URL_PART)) { S.settings.syncUrl = DEFAULT_SYNC_URL; await saveSettings(); }
     S.template = template || buildTemplate();
-    if (!template) { await saveTemplate(); }
+    if (!template) await DB.put('kv', S.template, 'template');
     S.buildings = buildings || [];
     for (const r of rounds) S.rounds.set(r.id, r);
     for (const i of issues) S.issues.set(i.id, i);
     S.log = log;
     if (!log.length) addLog('app', `Première ouverture de l'app (v${APP_VERSION})`);
+    if (!S.settings.docsV2) await migrateToSharedDocs(template);
   } catch (e) {
     $('#view').innerHTML = `<div class="card"><b>Impossible d'ouvrir le stockage local.</b><p class="muted">${esc(e.message)}</p><p class="muted">Navigation privée ? Ouvre l'app dans un onglet normal.</p></div>`;
     return;
   }
   render();
   registerSW();
-  if (S.settings.autoSync && pendingCount()) setTimeout(() => syncNow(false), 3000);
-  setInterval(() => { if (S.settings.autoSync && navigator.onLine && pendingCount()) syncNow(false); }, 5 * 60000);
+  if (S.settings.autoSync) setTimeout(() => syncNow(false), 2000);
+  setInterval(() => { if (S.settings.autoSync && navigator.onLine) syncNow(false); }, 3 * 60000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && S.settings.autoSync && (!S.settings.lastSync || Date.now() - new Date(S.settings.lastSync) > 30000)) syncNow(false);
+  });
 })();
