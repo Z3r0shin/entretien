@@ -1,6 +1,6 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.2.2';
 // Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
 const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
 // Script « Entretien préventif — Synchro » (projet séparé). Le jeton secret, lui, n'est jamais dans le code.
@@ -559,7 +559,7 @@ function viewSettings() {
     <h3 style="margin-top:16px">État de la synchro</h3>
     <ul class="list" style="font-size:.9rem">
       <li>Version de l'app : <b>${APP_VERSION}</b> · appareil : <b>${esc(st.device || '—')}</b></li>
-      <li>Adresse du script : ${st.syncUrl ? (st.syncUrl === DEFAULT_SYNC_URL ? '<span class="pill ok">OK</span>' : '<span class="pill todo">personnalisée</span>') : '<span class="pill due">manquante</span>'} · jeton : ${st.syncToken ? '<span class="pill ok">entré</span>' : '<span class="pill due">manquant</span>'} · auto : ${st.autoSync ? 'oui' : 'non'}</li>
+      <li>Adresse du script : ${st.syncUrl ? (st.syncUrl === DEFAULT_SYNC_URL ? '<span class="pill ok">OK</span>' : '<span class="pill todo">personnalisée</span> <button class="btn small" data-act="officialUrl">Utiliser l&#39;adresse officielle</button>') : '<span class="pill due">manquante</span>'} · jeton : ${st.syncToken ? '<span class="pill ok">entré</span>' : '<span class="pill due">manquant</span>'} · auto : ${st.autoSync ? 'oui' : 'non'}</li>
       <li>Dernière synchro réussie : <b>${st.lastSync ? fmtDT(st.lastSync) : 'jamais'}</b> · <span id="syncpill">${syncPill()}</span></li>
       ${st.lastSyncError ? `<li style="color:var(--due)">Dernière erreur (${fmtDT(st.lastSyncErrorAt)}) : <b>${esc(st.lastSyncError)}</b></li>` : ''}
       <li>En attente d'envoi : <b>${pendingCount()}</b> · fiches reçues du serveur jusqu'au n° <b>${st.pullSeq || 0}</b> · ${navigator.onLine ? 'en ligne' : 'hors-ligne'}</li>
@@ -815,6 +815,15 @@ async function remapBuilding(old, newId, extId) {
   return nb;
 }
 
+// L'adresse configurée pointe vers un script qui ne connaît pas la synchro entre appareils
+// (ex. un projet créé avec une ancienne version du guide) : on revient à l'adresse officielle.
+async function useOfficialScript(reason) {
+  if ((S.settings.syncUrl || '').trim() === DEFAULT_SYNC_URL) return false;
+  S.settings.syncUrl = DEFAULT_SYNC_URL; S.settings.pullSeq = 0; await saveSettings();
+  addLog('reglage', `Adresse du script remise à l'adresse officielle (${reason})`);
+  return true;
+}
+const OLD_SCRIPT_MSG = 'Ce script Google n\'est pas à jour : il ne fait pas la synchro entre appareils.';
 let syncTimer = null;
 function scheduleSync(delay = 20000) {
   refreshPill();
@@ -833,7 +842,7 @@ async function syncNow(manual) {
   if (!navigator.onLine) { if (manual) toast('Pas d\'internet : les données attendent dans l\'appareil.'); return; }
   if (syncing) return;
   syncing = true; refreshPill();
-  let received = 0, ok = false;
+  let received = 0, ok = false, retry = false;
   try {
     // 1) Photos pas encore envoyées
     const photos = await DB.all('photos');
@@ -858,6 +867,7 @@ async function syncNow(manual) {
         { name: 'Résultats', headers: H_RESULTS, rows: rounds.flatMap(resultRows) },
         { name: 'Suivis', headers: H_ISSUES, rows: issues.map(issueRow) },
         { name: 'Journal', headers: H_LOG, rows: logs.map(logRow) }] });
+      if (!res.acks) { if (await useOfficialScript('ancien script sans synchro entre appareils')) { retry = true; throw new Error('Adresse corrigée, nouvel essai…'); } throw new Error(OLD_SCRIPT_MSG); }
       const acks = res.acks || {}, rejected = res.rejected || 0;
       for (const [key, o, rev, kind] of snap) {
         if (acks[key] === undefined) continue;          // refusée : sera fusionnée puis renvoyée
@@ -889,6 +899,7 @@ async function syncNow(manual) {
     console.warn('sync', e);
   } finally {
     syncing = false; refreshPill();
+    if (retry) { setTimeout(() => syncNow(manual), 300); return; }
     if (received || location.hash.startsWith('#/reglages') || location.hash.startsWith('#/journal')) softRender();
     if (ok && pendingCount()) scheduleSync(1500);
   }
@@ -975,13 +986,19 @@ const ACT = {
   testSync: async () => {
     if (!S.settings.syncUrl) { toast('Entre l\'adresse du script.'); return; }
     try {
-      const j = await post({ action: 'ping' });
+      let j = await post({ action: 'ping' });
+      if (j.version !== 2) {
+        if (!(await useOfficialScript('ancien script détecté au test'))) throw new Error(OLD_SCRIPT_MSG);
+        toast('Ancienne adresse remplacée par l\'adresse officielle.', 3000);
+        j = await post({ action: 'ping' });
+      }
       const imp = await importBuildings();
       toast(`Connexion OK ✓ — ${j.sheet || 'feuille'} · ${imp.total} école(s) ${imp.subsector}${imp.added ? `, ${imp.added} ajoutée(s)` : ''}`, 5000);
       render();
     } catch (e) { toast('Échec : ' + e.message, 6000); }
   },
   syncNow: () => syncNow(true),
+  officialUrl: async () => { await useOfficialScript('choisi dans Réglages'); toast('Adresse officielle rétablie'); render(); await syncNow(true); },
   importBlds: async () => {
     if (!S.settings.syncUrl || !S.settings.syncToken) { toast('Configure d\'abord la synchro Google (Réglages).'); location.hash = '#/reglages'; return; }
     try { const imp = await importBuildings(); toast(`${imp.total} école(s) ${imp.subsector} · ${imp.added} ajoutée(s)`, 4000); render(); } catch (e) { toast('Échec : ' + e.message, 6000); }
