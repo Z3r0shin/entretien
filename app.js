@@ -1,6 +1,6 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 // Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
 const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
 // Script « Entretien préventif — Synchro » (projet séparé). Le jeton secret, lui, n'est jamais dans le code.
@@ -140,7 +140,9 @@ function closeSheet() { const d = $('#sheet'); if (d.open) d.close(); }
 function syncPill() {
   const pending = pendingCount();
   if (!S.settings.syncUrl) return navigator.onLine ? '<span class="pill">En ligne</span>' : '<span class="pill off">Hors-ligne</span>';
+  if (!S.settings.syncToken) return '<a class="pill todo" href="#/reglages">Synchro non activée</a>';
   if (syncing) return '<span class="pill">Synchro…</span>';
+  if (S.settings.lastSyncError && navigator.onLine) return '<a class="pill due" href="#/reglages">Erreur de synchro</a>';
   if (pending) return `<span class="pill todo">${navigator.onLine ? '' : 'Hors-ligne · '}${pending} à envoyer</span>`;
   return '<span class="pill ok">Synchronisé</span>';
 }
@@ -188,6 +190,8 @@ function viewHome() {
   if (!S.settings.worker) h += `<div class="card"><label class="field"><span>Ton nom (apparaît dans les rapports et le journal)</span><input type="text" id="workerName" placeholder="Prénom Nom"></label><button class="btn primary" data-act="saveWorker">Enregistrer</button></div>`;
   if (S.settings.syncUrl && !S.settings.syncToken) h += `<div class="card"><b>Active la synchro</b><p class="muted">Entre le jeton secret une fois sur cet appareil : tes écoles arrivent, et le cell et le PC partagent les mêmes fiches.</p>
     <label class="field"><span>Jeton secret</span><input type="password" id="tokenInput" autocomplete="off"></label><button class="btn primary" data-act="saveToken">Activer</button></div>`;
+  else if (S.settings.syncToken && S.settings.lastSyncError && navigator.onLine) h += `<div class="card" style="border-color:var(--due)"><b>La synchro a échoué</b><p class="muted">${esc(S.settings.lastSyncError)} (${fmtDT(S.settings.lastSyncErrorAt)})</p>
+    <div class="actions"><button class="btn primary" data-act="syncNow">Réessayer</button><button class="btn" data-act="go" data-to="#/reglages">Détails</button></div></div>`;
   const blds = activeBuildings();
   if (!blds.length) {
     h += `<div class="card"><h3>Ajoute tes écoles</h3><p class="muted">Une tournée est toujours liée à un bâtiment.</p>
@@ -551,8 +555,15 @@ function viewSettings() {
     <label class="field"><span>Adresse du script (se termine par /exec)</span><input type="url" data-change="setting" data-key="syncUrl" value="${esc(st.syncUrl)}" placeholder="https://script.google.com/macros/s/…/exec"></label>
     <label class="field"><span>Jeton secret (le même que dans le script)</span><input type="password" data-change="setting" data-key="syncToken" value="${esc(st.syncToken)}"></label>
     <label class="switch"><span>Synchroniser automatiquement</span><input type="checkbox" data-change="settingBool" data-key="autoSync" ${st.autoSync ? 'checked' : ''}></label>
-    <p class="muted">${st.lastSync ? 'Dernière synchro : ' + fmtDT(st.lastSync) : 'Jamais synchronisé'} · <span id="syncpill">${syncPill()}</span></p>
-    <div class="actions"><button class="btn" data-act="testSync">Tester</button><button class="btn primary" data-act="syncNow">Synchroniser maintenant</button></div></div>`;
+    <div class="actions"><button class="btn" data-act="testSync">Tester</button><button class="btn primary" data-act="syncNow">Synchroniser maintenant</button></div>
+    <h3 style="margin-top:16px">État de la synchro</h3>
+    <ul class="list" style="font-size:.9rem">
+      <li>Version de l'app : <b>${APP_VERSION}</b> · appareil : <b>${esc(st.device || '—')}</b></li>
+      <li>Adresse du script : ${st.syncUrl ? (st.syncUrl === DEFAULT_SYNC_URL ? '<span class="pill ok">OK</span>' : '<span class="pill todo">personnalisée</span>') : '<span class="pill due">manquante</span>'} · jeton : ${st.syncToken ? '<span class="pill ok">entré</span>' : '<span class="pill due">manquant</span>'} · auto : ${st.autoSync ? 'oui' : 'non'}</li>
+      <li>Dernière synchro réussie : <b>${st.lastSync ? fmtDT(st.lastSync) : 'jamais'}</b> · <span id="syncpill">${syncPill()}</span></li>
+      ${st.lastSyncError ? `<li style="color:var(--due)">Dernière erreur (${fmtDT(st.lastSyncErrorAt)}) : <b>${esc(st.lastSyncError)}</b></li>` : ''}
+      <li>En attente d'envoi : <b>${pendingCount()}</b> · fiches reçues du serveur jusqu'au n° <b>${st.pullSeq || 0}</b> · ${navigator.onLine ? 'en ligne' : 'hors-ligne'}</li>
+    </ul></div>`;
   h += `<div class="card"><h3>Sauvegarde</h3><p class="muted">${st.lastBackup ? 'Dernière sauvegarde : ' + fmtDT(st.lastBackup) : 'Aucune sauvegarde faite.'} Le fichier contient tout (photos incluses). Garde-le sur Drive ou ton ordi.</p>
     <div class="actions"><button class="btn primary" data-act="backup">Sauvegarder (fichier)</button><button class="btn" data-act="restore">Restaurer…</button></div>
     <p class="muted" id="persistInfo"></p></div>`;
@@ -868,11 +879,13 @@ async function syncNow(manual) {
     // 3) Écoles de la feuille (Pointe-aux-Trembles), après réception pour ne pas dupliquer ce qu'un autre appareil a déjà importé
     let imp = null;
     try { imp = await importBuildings(); } catch (e) { console.warn('écoles', e); }
-    S.settings.lastSync = nowISO(); await saveSettings();
+    S.settings.lastSync = nowISO(); S.settings.lastSyncError = ''; S.settings.lastSyncErrorAt = null; await saveSettings();
     ok = true;
     if (manual) toast('Synchronisation réussie ✓' + (received ? ` — ${received} changement(s) reçu(s)` : '') + (imp && imp.added ? ` — ${imp.added} école(s) ajoutée(s)` : ''), 4000);
   } catch (e) {
-    if (manual) toast('Synchro : ' + e.message, 5000);
+    // Garder l'erreur visible (pastille + Réglages) : une synchro automatique ratée ne doit pas passer inaperçue.
+    S.settings.lastSyncError = e.message || String(e); S.settings.lastSyncErrorAt = nowISO(); await saveSettings();
+    if (manual) toast('Synchro : ' + e.message, 6000);
     console.warn('sync', e);
   } finally {
     syncing = false; refreshPill();
@@ -1035,16 +1048,34 @@ function showUpdateBanner() {
   b.innerHTML = 'Nouvelle version disponible <button class="btn small" id="doUpdate">Mettre à jour</button>';
   $('#doUpdate').onclick = () => swReg.waiting.postMessage('skipWaiting');
 }
+// Une nouvelle version s'installe seule (sw.js appelle skipWaiting). On recharge dès que
+// c'est sans risque ; si l'utilisateur est en train d'écrire, on attend et on affiche un bouton.
+function reloadWhenSafe() {
+  const busy = () => $('#sheet').open || (document.activeElement && /^(TEXTAREA|INPUT|SELECT)$/.test(document.activeElement.tagName));
+  if (!busy()) { flushSheetNotes(); location.reload(); return; }
+  const b = $('#banner'); b.hidden = false;
+  b.innerHTML = 'Nouvelle version prête <button class="btn small" id="doReload">Recharger</button>';
+  $('#doReload').onclick = () => { flushSheetNotes(); location.reload(); };
+}
 async function registerSW() {
   if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
   try {
     swReg = await navigator.serviceWorker.register('sw.js');
-    showUpdateBanner();
-    swReg.addEventListener('updatefound', () => { const w = swReg.installing; w?.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) showUpdateBanner(); }); });
+    if (swReg.waiting) swReg.waiting.postMessage('skipWaiting');
     // Recharger seulement lors d'une mise à jour (pas à la toute première installation).
     let reloaded = !navigator.serviceWorker.controller;
-    navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloaded) { reloaded = true; location.reload(); } });
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloaded) { reloaded = true; reloadWhenSafe(); } });
+    // Chercher une mise à jour à chaque retour dans l'app (le téléphone garde l'app ouverte longtemps).
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') swReg.update().catch(() => {}); });
   } catch (e) { console.warn('SW', e); }
+}
+function guessDevice() {
+  const ua = navigator.userAgent;
+  if (/Android/i.test(ua)) return 'Cell Android';
+  if (/iPhone|iPad/i.test(ua)) return 'iPhone';
+  if (/Windows/i.test(ua)) return 'PC Windows';
+  if (/Mac/i.test(ua)) return 'Mac';
+  return 'Appareil';
 }
 
 // Passage à la v1.2 : toutes les fiches existantes partent une fois vers la feuille partagée.
@@ -1067,6 +1098,7 @@ async function migrateToSharedDocs(storedTemplate) {
     const [settings, template, buildings, rounds, issues, log] = await Promise.all([DB.get('kv', 'settings'), DB.get('kv', 'template'), DB.get('kv', 'buildings'), DB.all('rounds'), DB.all('issues'), DB.all('log')]);
     if (settings) S.settings = { ...S.settings, ...settings };
     if (!S.settings.syncUrl || S.settings.syncUrl.includes(RETIRED_SYNC_URL_PART)) { S.settings.syncUrl = DEFAULT_SYNC_URL; await saveSettings(); }
+    if (!S.settings.device) { S.settings.device = guessDevice(); await saveSettings(); }
     S.template = template || buildTemplate();
     if (!template) await DB.put('kv', S.template, 'template');
     S.buildings = buildings || [];
