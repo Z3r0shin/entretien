@@ -1,7 +1,7 @@
 /* Service worker : garde l'app en cache pour qu'elle s'ouvre sans internet.
    Change CACHE à chaque nouvelle version pour que les téléphones la reçoivent. */
-const CACHE = 'ep-v1.2.3';
-const FILES = ['./', 'index.html', 'style.css', 'app.js', 'data.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png'];
+const CACHE = 'ep-v1.3.0';
+const FILES = ['./', 'index.html', 'style.css', 'app.js', 'bon.js', 'data.js', 'vendor/jspdf.umd.min.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png'];
 
 self.addEventListener('install', e => {
   // s'activer tout de suite : les appareils restés sur une vieille version passent à celle-ci sans bouton

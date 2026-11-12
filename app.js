@@ -1,6 +1,6 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.2.3';
+const APP_VERSION = '1.3.0';
 // Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
 const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
 // Script « Entretien préventif — Synchro » (projet séparé). Le jeton secret, lui, n'est jamais dans le code.
@@ -66,7 +66,7 @@ const DB = {
 const S = {
   settings: { worker: '', syncUrl: DEFAULT_SYNC_URL, syncToken: '', autoSync: true, lastSync: null, lastBackup: null, device: '' },
   template: null, buildings: [], rounds: new Map(), issues: new Map(), log: [],
-  ui: { filter: 'all', issueTab: 'open', issueBld: '', histBld: '', logBld: '', logQ: '', logLimit: 150, collapsed: {} }
+  ui: { filter: 'all', issueTab: 'open', issueBld: '', issueQ: '', histBld: '', logBld: '', logQ: '', logLimit: 150, collapsed: {} }
 };
 let deferredInstall = null, syncing = false, swReg = null;
 
@@ -97,12 +97,32 @@ const liveRounds = () => [...S.rounds.values()].filter(r => !r.deleted);
 const openRoundFor = bid => liveRounds().find(r => r.buildingId === bid && !r.endedAt);
 function touchBld(b) { b.updatedAt = nowISO(); b.dirty = 1; b.rev = (b.rev || 0) + 1; }
 
+// ---------- Numéros de suivi : préfixe CSSPI de l'école + 5 caractères (ex. 057-K7Q3M) ----------
+// Préfixe à 3 chiffres des requêtes CSSPI, selon l'ID de l'école dans l'onglet « Bâtiments ».
+const DEFAULT_PREFIX = { B001: '002', B006: '050', B007: '006', B015: '057', B021: '012', B022: '030', B028: '013' };
+const EXCLUDED_EXT = ['B024'];   // Pointe-aux-Trembles (Sec.) : pas une école de cet ouvrier
+const NO_CHARS = '2346789ACDEFGHJKMNPQRTUVWXYZ';   // sans 0/O, 1/I/L, 5/S, 8/B
+function bldPrefix(id) { const b = findBld(id); return (b && (b.prefix || DEFAULT_PREFIX[b.extId])) || '000'; }
+function noCode(n) { let s = ''; for (let k = 0; k < 5; k++) { s += NO_CHARS[n % NO_CHARS.length]; n = Math.floor(n / NO_CHARS.length); } return s; }
+function hash32(str) { let h = 2166136261; for (let k = 0; k < str.length; k++) { h ^= str.charCodeAt(k); h = Math.imul(h, 16777619); } return h >>> 0; }
+// Un ancien suivi sans numéro en reçoit un calculé à partir de son ID : le même sur tous les appareils.
+// Il est figé dans la fiche à sa prochaine modification.
+const issueNo = i => i.no || `${bldPrefix(i.buildingId)}-${noCode(hash32(i.id))}`;
+// École sans préfixe (000) : pas de numéro figé, il reste calculé jusqu'à ce que le préfixe soit connu.
+function newIssueNo(bid) {
+  if (bldPrefix(bid) === '000') return undefined;
+  const used = new Set([...S.issues.values()].map(issueNo)); let n;
+  do n = `${bldPrefix(bid)}-${noCode(crypto.getRandomValues(new Uint32Array(1))[0])}`; while (used.has(n));
+  return n;
+}
+const normNo = s => String(s || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+
 // ---------- Persistance ----------
 const saveSettings = () => DB.put('kv', S.settings, 'settings');
 function saveTemplate() { S.template.updatedAt = nowISO(); S.template.dirty = 1; S.template.rev = (S.template.rev || 0) + 1; scheduleSync(); return DB.put('kv', S.template, 'template'); }
 const saveBuildings = () => DB.put('kv', S.buildings, 'buildings');
 function saveRound(r) { r.rev = (r.rev || 0) + 1; r.dirty = 1; r.updatedAt = nowISO(); S.rounds.set(r.id, r); scheduleSync(); return DB.put('rounds', r); }
-function saveIssue(i) { i.rev = (i.rev || 0) + 1; i.dirty = 1; i.updatedAt = nowISO(); S.issues.set(i.id, i); scheduleSync(); return DB.put('issues', i); }
+function saveIssue(i) { if (!i.no && bldPrefix(i.buildingId) !== '000') i.no = issueNo(i); i.rev = (i.rev || 0) + 1; i.dirty = 1; i.updatedAt = nowISO(); S.issues.set(i.id, i); scheduleSync(); return DB.put('issues', i); }
 function addLog(type, msg, ctx = {}) {
   const e = { id: uid(), ts: nowISO(), type, msg, buildingId: ctx.buildingId || '', roundId: ctx.roundId || '', taskId: ctx.taskId || '', issueId: ctx.issueId || '', device: S.settings.device || '', synced: 0 };
   S.log.push(e);
@@ -315,7 +335,7 @@ async function setStatus(rid, tid, st) {
     r.results[tid] = res;
     addLog('tache.statut', `${label} : ${STATUS[st].label}`, ctx);
     if (st === 'todo' && !res.issueId) {
-      const i = { id: uid(), buildingId: r.buildingId, roundId: r.id, taskId: tid, label, createdAt: res.at, note: res.note || '', status: 'open', closedAt: null, closeNote: '', photos: [] };
+      const i = { id: uid(), no: newIssueNo(r.buildingId), by: r.worker || S.settings.worker || '', buildingId: r.buildingId, roundId: r.id, taskId: tid, label, createdAt: res.at, note: res.note || '', status: 'open', closedAt: null, closeNote: '', photos: [] };
       res.issueId = i.id;
       await saveIssue(i);
       addLog('suivi.ouvert', `Suivi ouvert : ${label}`, { ...ctx, issueId: i.id });
@@ -426,16 +446,20 @@ async function fillPhotos(root) {
 
 // ---------- Vue : Suivis ----------
 function viewIssues() {
-  const tab = S.ui.issueTab, fb = S.ui.issueBld;
-  let list = [...S.issues.values()].filter(i => (tab === 'open' ? i.status === 'open' : i.status !== 'open') && (!fb || i.buildingId === fb));
+  const tab = S.ui.issueTab, fb = S.ui.issueBld, q = normNo(S.ui.issueQ), qt = (S.ui.issueQ || '').trim().toLowerCase();
+  // Avec une recherche : tous les suivis (ouverts ou non) dont le numéro, le no CSSPI ou le texte correspond
+  const byNo = q && (/\d/.test(q) || q.length >= 3);   // « A » seul ne doit pas trouver tous les numéros
+  const hit = i => (byNo && (normNo(issueNo(i)).includes(q) || normNo(i.csspi).includes(q))) || (i.label + ' ' + (i.note || '')).toLowerCase().includes(qt);
+  let list = [...S.issues.values()].filter(i => (qt ? hit(i) : (tab === 'open' ? i.status === 'open' : i.status !== 'open')) && (!fb || findBld(i.buildingId)?.id === fb));
   list.sort((a, z) => (tab === 'open' ? a.createdAt.localeCompare(z.createdAt) : (z.closedAt || '').localeCompare(a.closedAt || '')));
   let h = topBar('Suivis', { sub: 'Travaux à faire trouvés en tournée' });
   h += `<div class="chips"><button class="chip ${tab === 'open' ? 'on' : ''}" data-act="issueTab" data-t="open">Ouverts</button><button class="chip ${tab !== 'open' ? 'on' : ''}" data-act="issueTab" data-t="closed">Réglés / annulés</button></div>`;
   h += bldSelect('issueBld', fb);
+  h += `<label class="field"><span>Rechercher</span><input type="search" data-input="issueQ" value="${esc(S.ui.issueQ || '')}" placeholder="No de suivi, no CSSPI ou mot"></label>`;
   if (!list.length) h += `<p class="empty">${tab === 'open' ? 'Aucun suivi ouvert. 👍' : 'Rien ici pour l\'instant.'}</p>`;
   for (const i of list) {
     const age = daysSince(i.createdAt);
-    h += `<div class="card" data-act="issueSheet" data-id="${i.id}" style="cursor:pointer"><div class="head"><div><b>${esc(i.label)}</b><br><small>${esc(bName(i.buildingId))} · ouvert ${fmtShort(i.createdAt)}${i.status === 'open' ? ` (${age} j)` : ''}</small></div>
+    h += `<div class="card" data-act="issueSheet" data-id="${i.id}" style="cursor:pointer"><div class="head"><div><span class="no">${issueNo(i)}</span> <b>${esc(i.label)}</b><br><small>${esc(bName(i.buildingId))} · ouvert ${fmtShort(i.createdAt)}${i.status === 'open' ? ` (${age} j)` : ''}${i.csspi ? ' · CSSPI ' + esc(i.csspi) : ''}${i.sentAt ? ' · envoyé le ' + fmtShort(i.sentAt) : ''}</small></div>
       <span class="pill ${i.status === 'open' ? 'todo' : i.status === 'closed' ? 'ok' : 'off'}">${i.status === 'open' ? 'Ouvert' : i.status === 'closed' ? 'Réglé' : 'Annulé'}</span></div>
       ${i.note ? `<div class="notepreview">${esc(i.note)}</div>` : ''}${i.closeNote ? `<div class="notepreview">→ ${esc(i.closeNote)}${i.closedAt ? ' (' + fmtShort(i.closedAt) + ')' : ''}</div>` : ''}
       ${i.photos?.length ? `<div class="thumbs">${i.photos.slice(0, 4).map(p => `<img data-photo="${p}" alt="Photo">`).join('')}</div>` : ''}</div>`;
@@ -448,8 +472,10 @@ function bldSelect(key, val) {
 }
 function openIssueSheet(id) {
   const i = S.issues.get(id); if (!i) return;
-  openSheet(`<h3>${esc(i.label)}</h3><p class="muted">${esc(bName(i.buildingId))} · ouvert le ${fmtDT(i.createdAt)}${i.closedAt ? ' · fermé le ' + fmtDT(i.closedAt) : ''}</p>
+  openSheet(`<h3><span class="no">${issueNo(i)}</span> ${esc(i.label)}</h3><p class="muted">${esc(bName(i.buildingId))} · ouvert le ${fmtDT(i.createdAt)}${i.closedAt ? ' · fermé le ' + fmtDT(i.closedAt) : ''}${i.sentAt ? ' · bon envoyé le ' + fmtDT(i.sentAt) : ''}</p>
     <label class="field"><span>Description</span><textarea data-change="issueNote" data-id="${i.id}">${esc(i.note || '')}</textarea></label>
+    <label class="field"><span>No de requête CSSPI</span><span class="inrow"><input type="text" inputmode="numeric" maxlength="12" placeholder="8 chiffres" data-change="issueCsspi" data-id="${i.id}" value="${esc(i.csspi || '')}">${canScan() ? `<button class="btn" data-act="scanCsspi" data-id="${i.id}" aria-label="Scanner le code-barres">▥ Scanner</button>` : ''}</span></label>
+    <button class="btn block" data-act="sendBon" data-id="${i.id}">📤 Envoyer le bon (PDF)</button>
     <div class="thumbs">${(i.photos || []).map(p => `<img data-photo="${p}" alt="Photo" data-act="viewPhoto" data-id="${p}">`).join('')}</div>
     ${i.status === 'open'
       ? `<label class="field"><span>Ce qui a été fait (pour fermer)</span><textarea id="closeNote" placeholder="ex. Pièce remplacée, bon de travail #1234…"></textarea></label>
@@ -562,8 +588,9 @@ function viewSettings() {
   let h = topBar('Réglages', { sub: `Version ${APP_VERSION}` });
   h += `<div class="card"><h3>Employé</h3><label class="field"><span>Nom</span><input type="text" data-change="setting" data-key="worker" value="${esc(st.worker)}"></label>
     <label class="field"><span>Nom de cet appareil (optionnel)</span><input type="text" data-change="setting" data-key="device" value="${esc(st.device)}" placeholder="ex. Cell de Guillaume"></label></div>`;
-  h += `<div class="card"><h3>Écoles / bâtiments</h3><ul class="list">${listedBuildings().map(b => `<li class="switch"><span>${esc(b.name)}${b.archived ? ' <span class="pill off">archivée</span>' : ''}</span>
+  h += `<div class="card"><h3>Écoles / bâtiments</h3><ul class="list">${listedBuildings().map(b => `<li class="switch"><span><input class="prefix" type="text" inputmode="numeric" maxlength="3" placeholder="000" aria-label="Préfixe CSSPI" data-change="bldPrefix" data-id="${b.id}" value="${esc(b.prefix || DEFAULT_PREFIX[b.extId] || '')}"> ${esc(b.name)}${b.archived ? ' <span class="pill off">archivée</span>' : ''}</span>
       <span class="actions"><button class="btn small" data-act="renameBld" data-id="${b.id}">Renommer</button><button class="btn small" data-act="archiveBld" data-id="${b.id}">${b.archived ? 'Réactiver' : 'Archiver'}</button></span></li>`).join('') || '<li class="muted">Aucune.</li>'}</ul>
+    <p class="muted">Le nombre à gauche est le préfixe CSSPI de l'école : il commence les numéros de suivi (ex. 057-K7Q3M).</p>
     <label class="field"><span>Ajouter</span><input type="text" id="newBld" placeholder="Nom de l'école"></label><span class="actions"><button class="btn" data-act="addBuilding">Ajouter</button><button class="btn" data-act="importBlds">Importer de la feuille Google</button></span>
     ${S.settings.lastBuildingsImport ? `<p class="muted">Dernier import : ${fmtDT(S.settings.lastBuildingsImport)}${S.settings.subsector ? ' · ' + esc(S.settings.subsector) : ''}</p>` : ''}</div>`;
   const active = flatTasks().length, sug = flatTasks(false).filter(x => x.task.suggested && !x.task.active).length;
@@ -586,7 +613,8 @@ function viewSettings() {
     <div class="actions"><button class="btn primary" data-act="backup">Sauvegarder (fichier)</button><button class="btn" data-act="restore">Restaurer…</button></div>
     <p class="muted" id="persistInfo"></p></div>`;
   h += `<div class="card"><h3>À propos</h3><p class="muted">Données conservées dans ce téléphone (IndexedDB). Désinstaller l'app ou effacer les données du navigateur les supprime : fais des sauvegardes ou active la synchro Google.</p>
-    <button class="btn small" data-act="checkUpdate">Chercher une mise à jour</button></div>`;
+    <button class="btn small" data-act="checkUpdate">Chercher une mise à jour</button>
+    <p class="muted" style="margin-top:10px">Moustache des bons de suivi : d'après « Flat hairy moustache icon » de Vexels (vexels.com).</p></div>`;
   setTimeout(showPersistInfo, 0);
   return h;
 }
@@ -639,7 +667,7 @@ async function download(name, content, type) {
 const stamp = () => fmtD(nowISO()).replace(/-/g, '') + '-' + fmtT(nowISO()).replace(':', '');
 const H_RESULTS = ['ID', 'ID tournée', 'École', 'Date', 'Heure', 'Section', 'Élément', 'Tâche', 'Statut', 'Note', 'Photos', 'Employé', 'Modifié le', 'BâtimentID'];
 const H_ROUNDS = ['ID', 'École', 'Employé', 'Début', 'Fin', 'Durée (min)', 'Tâches cochées', 'Fait', 'Corrigé', 'À suivre', 'N/A', 'Notes', 'Modifié le', 'BâtimentID'];
-const H_ISSUES = ['ID', 'École', 'Élément / tâche', 'Ouvert le', 'Statut', 'Description', 'Fermé le', 'Note de fermeture', 'ID tournée', 'Photos', 'Modifié le', 'BâtimentID'];
+const H_ISSUES = ['ID', 'École', 'Élément / tâche', 'Ouvert le', 'Statut', 'Description', 'Fermé le', 'Note de fermeture', 'ID tournée', 'Photos', 'Modifié le', 'BâtimentID', 'No suivi', 'No requête CSSPI', 'Bon envoyé le', 'Bon (Drive)'];
 const H_LOG = ['ID', 'Horodatage', 'Type', 'École', 'Détail', 'Appareil', 'ID tournée'];
 const ISSUE_ST = { open: 'Ouvert', closed: 'Réglé', cancelled: 'Annulé' };
 function resultRows(r) {
@@ -651,7 +679,7 @@ function roundRow(r) {
   return [r.id, bName(r.buildingId), r.worker || '', fmtDT(r.startedAt), r.endedAt ? fmtDT(r.endedAt) : '', r.endedAt ? minutesBetween(r.startedAt, r.endedAt) : '', c.done, c.ok, c.fixed, c.todo, c.na, (r.deleted ? '[SUPPRIMÉE] ' : '') + (r.notes || ''), fmtDT(r.updatedAt || nowISO()), (S.buildings.find(b => b.id === r.buildingId) || {}).extId || ''];
 }
 function issueRow(i) {
-  return [i.id, bName(i.buildingId), i.label, fmtDT(i.createdAt), ISSUE_ST[i.status] || i.status, i.note || '', i.closedAt ? fmtDT(i.closedAt) : '', i.closeNote || '', i.roundId || '', (i.photos || []).map(p => (i.photoUrls || {})[p] || '(photo locale)').join(' '), fmtDT(i.updatedAt || nowISO()), (S.buildings.find(b => b.id === i.buildingId) || {}).extId || ''];
+  return [i.id, bName(i.buildingId), i.label, fmtDT(i.createdAt), ISSUE_ST[i.status] || i.status, i.note || '', i.closedAt ? fmtDT(i.closedAt) : '', i.closeNote || '', i.roundId || '', (i.photos || []).map(p => (i.photoUrls || {})[p] || '(photo locale)').join(' '), fmtDT(i.updatedAt || nowISO()), (S.buildings.find(b => b.id === i.buildingId) || {}).extId || '', issueNo(i), i.csspi || '', i.sentAt ? fmtDT(i.sentAt) : '', i.bonUrl || ''];
 }
 const logRow = l => [l.id, fmtDT(l.ts), l.type, l.buildingId ? bName(l.buildingId) : '', l.msg, l.device || '', l.roundId || ''];
 
@@ -802,6 +830,11 @@ async function importBuildings() {
   const j = await post({ action: 'buildings' });
   let added = 0, renamed = 0;
   for (const rb of j.buildings || []) {
+    if (EXCLUDED_EXT.includes(rb.id)) {
+      const x = S.buildings.find(y => y.extId === rb.id && !y.mergedInto);
+      if (x && !x.archived && !(S.settings.excludedDone || []).includes(rb.id)) { x.archived = true; touchBld(x); S.settings.excludedDone = [...(S.settings.excludedDone || []), rb.id]; addLog('ecole.archive', `École retirée de la liste : ${x.name}`, { buildingId: x.id }); }
+      continue;
+    }
     const want = 'ext-' + rb.id, key = rb.name.trim().toLowerCase();
     let b = S.buildings.find(x => x.id === want)
       || S.buildings.find(x => x.extId === rb.id && !x.mergedInto)
@@ -821,7 +854,7 @@ async function importBuildings() {
   }
   await saveBuildings();
   S.settings.subsector = j.subsector || ''; S.settings.lastBuildingsImport = nowISO(); await saveSettings();
-  return { added, renamed, total: (j.buildings || []).length, subsector: j.subsector || '' };
+  return { added, renamed, total: (j.buildings || []).filter(rb => !EXCLUDED_EXT.includes(rb.id)).length, subsector: j.subsector || '' };
 }
 // Une école liée à la feuille prend l'ID stable « ext-<ID feuille> » : tous les appareils parlent ainsi de la même école.
 async function remapBuilding(old, newId, extId) {
@@ -880,7 +913,7 @@ async function syncNow(manual) {
       const photoDocs = (await DB.all('photos')).filter(p => p.docDirty && (p.fileId || p.url));
       const { docs, snap } = collectDocs(photoDocs);
       if (pass > 0 && !docs.length) break;
-      const rounds = [...S.rounds.values()].filter(r => r.dirty), issues = [...S.issues.values()].filter(i => i.dirty), logs = S.log.filter(l => !l.synced);
+      const rounds = [...S.rounds.values()].filter(r => r.dirty), issues = [...S.issues.values()].filter(i => i.dirty || !S.settings.issueColsV3), logs = S.log.filter(l => !l.synced);
       let res = await post({ action: 'sync', device: S.settings.device || '', since: S.settings.pullSeq || 0, docs, tables: [
         { name: 'Tournées', headers: H_ROUNDS, rows: rounds.map(roundRow) },
         { name: 'Résultats', headers: H_RESULTS, rows: rounds.flatMap(resultRows) },
@@ -905,9 +938,13 @@ async function syncNow(manual) {
       }
       if (!rejected) break;
     }
+    // 2b) Copies Drive des bons envoyés (un échec ne bloque pas le reste)
+    const bonFails = await uploadBons();
+    if (bonFails && manual) toast(`${bonFails} copie(s) Drive de bon en attente (nouvel essai à la prochaine synchro)`, 4000);
     // 3) Écoles de la feuille (Pointe-aux-Trembles), après réception pour ne pas dupliquer ce qu'un autre appareil a déjà importé
     let imp = null;
     try { imp = await importBuildings(); } catch (e) { console.warn('écoles', e); }
+    S.settings.issueColsV3 = true;
     S.settings.lastSync = nowISO(); S.settings.lastSyncError = ''; S.settings.lastSyncErrorAt = null; await saveSettings();
     ok = true;
     if (manual) toast('Synchronisation réussie ✓' + (received ? ` — ${received} changement(s) reçu(s)` : '') + (imp && imp.added ? ` — ${imp.added} école(s) ajoutée(s)` : ''), 4000);
@@ -976,6 +1013,14 @@ const ACT = {
   },
   issueTab: b => { S.ui.issueTab = b.dataset.t; render(); },
   issueSheet: b => openIssueSheet(b.dataset.id),
+  sendBon: b => sendBon(b.dataset.id),
+  shareBon: () => deliverBon(true),
+  scanCsspi: async () => {
+    flushSheetNotes();
+    const v = await scanBarcode(); if (!v) return;
+    const el = $('#sheetBody [data-change="issueCsspi"]');
+    if (el) { el.value = v; await CHG.issueCsspi(el); }
+  },
   bldIssues: b => { S.ui.issueBld = b.dataset.bld; S.ui.issueTab = 'open'; if (location.hash === '#/suivi') render(); else location.hash = '#/suivi'; },
   newIssue: b => newIssueSheet(b.dataset.bld),
   addDraftPhoto: () => { if (!issueDraft) return; photoCtx = { type: 'draft', id: issueDraft.id }; $('#photoInput').click(); },
@@ -983,8 +1028,8 @@ const ACT = {
     const bid = $('#niBld').value, label = $('#niLabel').value.trim(), note = $('#niNote').value.trim();
     if (!label) { toast('Indique l\'endroit / élément.'); return; }
     const d = issueDraft || { id: uid(), photos: [] }; issueDraft = null;
-    const i = { id: d.id, buildingId: bid, roundId: '', taskId: '', label, createdAt: nowISO(), note, status: 'open', closedAt: null, closeNote: '', photos: [...d.photos] };
-    await saveIssue(i); addLog('suivi.ouvert', `Suivi ouvert : ${label}${i.photos.length ? ` (${i.photos.length} photo${i.photos.length > 1 ? 's' : ''})` : ''}`, { buildingId: bid, issueId: i.id });
+    const i = { id: d.id, no: newIssueNo(bid), by: S.settings.worker || '', buildingId: bid, roundId: '', taskId: '', label, createdAt: nowISO(), note, status: 'open', closedAt: null, closeNote: '', photos: [...d.photos] };
+    await saveIssue(i); addLog('suivi.ouvert', `Suivi ouvert : ${i.no} - ${label}${i.photos.length ? ` (${i.photos.length} photo${i.photos.length > 1 ? 's' : ''})` : ''}`, { buildingId: bid, issueId: i.id });
     closeSheet(); toast('Suivi créé'); render();
   },
   closeIssue: async b => {
@@ -1046,6 +1091,22 @@ const ACT = {
 const CHG = {
   roundNote: async el => { const r = S.rounds.get(el.dataset.round); if ((r.notes || '') === el.value) return; r.notes = el.value; r.metaMt = nowISO(); await saveRound(r); addLog('tournee.note', `Note de tournée : « ${el.value.slice(0, 80)} »`, { buildingId: r.buildingId, roundId: r.id }); },
   taskNote: el => saveTaskNote(el.dataset.round, el.dataset.task, el.value.trim()),
+  issueCsspi: async el => {
+    const i = S.issues.get(el.dataset.id); const v = el.value.replace(/\s+/g, ''); el.value = v;
+    if ((i.csspi || '') === v) return;
+    const warn = checkCsspi(v, i.buildingId);
+    if (warn && !confirm(warn + ' Le garder quand même ?')) { el.value = i.csspi || ''; return; }
+    i.csspi = v; await saveIssue(i);
+    addLog('suivi.csspi', `Suivi ${issueNo(i)} : no de requête CSSPI ${v || '(effacé)'}`, { buildingId: i.buildingId, issueId: i.id });
+    toast(v ? 'No CSSPI enregistré' : 'No CSSPI effacé');
+  },
+  bldPrefix: async el => {
+    const x = S.buildings.find(y => y.id === el.dataset.id); const v = el.value.trim();
+    if (v && !/^\d{3}$/.test(v)) { toast('Le préfixe doit avoir 3 chiffres.'); el.value = x.prefix || DEFAULT_PREFIX[x.extId] || ''; return; }
+    if ((x.prefix || DEFAULT_PREFIX[x.extId] || '') === v) return;
+    x.prefix = v; touchBld(x); await saveBuildings(); scheduleSync();
+    addLog('ecole.prefixe', `Préfixe CSSPI de ${x.name} : ${v || '(aucun)'}`, { buildingId: x.id });
+  },
   issueNote: async el => { const i = S.issues.get(el.dataset.id); if ((i.note || '') === el.value.trim()) return; i.note = el.value.trim(); await saveIssue(i); addLog('suivi.note', `Suivi « ${i.label} » : note modifiée`, { buildingId: i.buildingId, issueId: i.id }); },
   uiSel: el => { S.ui[el.dataset.key] = el.value; render(); },
   setting: async el => {
@@ -1068,6 +1129,7 @@ document.addEventListener('click', e => {
 document.addEventListener('change', e => { const el = e.target.closest('[data-change]'); if (el && CHG[el.dataset.change]) CHG[el.dataset.change](el); });
 document.addEventListener('input', e => {
   const el = e.target.closest('[data-input]'); if (!el) return;
+  if (el.dataset.input === 'issueQ') { S.ui.issueQ = el.value; clearTimeout(ACT._q); ACT._q = setTimeout(() => { render(); const i = $('[data-input="issueQ"]'); if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 300); }
   if (el.dataset.input === 'logQ') { S.ui.logQ = el.value; clearTimeout(ACT._q); ACT._q = setTimeout(() => { render(); const i = $('[data-input="logQ"]'); if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 300); }
 });
 document.addEventListener('toggle', e => { const d = e.target; if (d.matches?.('details.section[data-sec]')) S.ui.collapsed[d.dataset.sec] = !d.open; }, true);
