@@ -1,6 +1,6 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 // Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
 const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
 // Script « Entretien préventif — Synchro » (projet séparé). Le jeton secret, lui, n'est jamais dans le code.
@@ -370,7 +370,7 @@ function openTaskSheet(rid, tid, hint = '') {
     <div class="seg" style="margin:10px 0">${Object.entries(STATUS).map(([k, s]) => `<button class="${k} ${res.status === k ? 'on' : ''}" data-act="setStatusSheet" data-round="${rid}" data-task="${tid}" data-st="${k}"><span class="s">${s.s}</span>${s.label}</button>`).join('')}</div>
     <label class="field"><span>Note (horodatée au journal)</span><textarea id="taskNote" data-change="taskNote" data-round="${rid}" data-task="${tid}" placeholder="Ce qui a été fait, matériel utilisé, observation…">${esc(res.note || '')}</textarea></label>
     <div class="thumbs">${(res.photos || []).map(p => `<img data-photo="${p}" alt="Photo" data-act="viewPhoto" data-id="${p}">`).join('')}</div>
-    <div class="actions"><button class="btn" data-act="addPhoto" data-round="${rid}" data-task="${tid}">📷 Ajouter une photo</button><button class="btn primary" data-act="closeSheet">Fermer</button></div>
+    <div class="actions">${photoBtns('addPhoto', `data-round="${rid}" data-task="${tid}"`)}<button class="btn primary" data-act="closeSheet">Fermer</button></div>
     ${ft.task.ref || src ? `<h2>Référence</h2><p>${esc(ft.task.ref)}</p>${src ? `<p class="muted">Source : ${src.url ? `<a href="${esc(src.url)}" target="_blank" rel="noopener">${esc(src.name)}</a>` : esc(src.name)}</p>` : ''}` : ''}
     ${hist.length ? `<h2>Historique (cette école)</h2><ul class="list">${hist.map(x => `<li><span class="stamp ${x.status}">${STATUS[x.status].label}</span> <span class="log-ts">${fmtDT(x.at)}</span>${x.note ? `<div class="notepreview">${esc(x.note)}</div>` : ''}</li>`).join('')}</ul>` : ''}`);
 }
@@ -400,12 +400,20 @@ function compressImage(file) {
     img.src = url;
   });
 }
-async function onPhotoPicked(file) {
-  if (!file || !photoCtx) return;
+// Deux boutons : appareil photo (capture) ou photos déjà prises (galerie, plusieurs à la fois)
+const photoBtns = (act, attrs) => `<button class="btn" data-act="${act}" data-src="cam" ${attrs}>📷 Photo</button><button class="btn" data-act="${act}" data-src="gal" ${attrs}>🖼️ Galerie</button>`;
+const pickPhoto = b => $(b?.dataset.src === 'gal' ? '#galleryInput' : '#photoInput').click();
+async function onPhotosPicked(files) {
+  const ctx = photoCtx; let ok = 0;
+  for (const f of files) { photoCtx = ctx; if (await onPhotoPicked(f, true)) ok++; }
+  if (ok) toast(ok > 1 ? `${ok} photos enregistrées` : 'Photo enregistrée');
+}
+async function onPhotoPicked(file, quiet) {
+  if (!file || !photoCtx) return false;
   try {
     const data = await compressImage(file);
     const draft = photoCtx.type === 'draft';
-    if (draft && (!issueDraft || issueDraft.id !== photoCtx.id)) return;  // formulaire fermé entre-temps
+    if (draft && (!issueDraft || issueDraft.id !== photoCtx.id)) return false;  // formulaire fermé entre-temps
     const p = { id: uid(), at: nowISO(), data, ref: draft ? { type: 'issue', id: photoCtx.id } : photoCtx, uploaded: 0, url: '' };
     await DB.put('photos', p);
     if (draft) {
@@ -428,8 +436,9 @@ async function onPhotoPicked(file) {
       openIssueSheet(i.id);
       if (location.hash.startsWith('#/suivi')) render();
     }
-    toast('Photo enregistrée');
-  } catch (e) { toast('Erreur photo : ' + e.message); }
+    if (!quiet) toast('Photo enregistrée');
+    return true;
+  } catch (e) { toast('Erreur photo : ' + e.message); return false; }
 }
 async function fillPhotos(root) {
   for (const img of $$('img[data-photo]', root)) {
@@ -479,7 +488,7 @@ function openIssueSheet(id) {
     <div class="thumbs">${(i.photos || []).map(p => `<img data-photo="${p}" alt="Photo" data-act="viewPhoto" data-id="${p}">`).join('')}</div>
     ${i.status === 'open'
       ? `<label class="field"><span>Ce qui a été fait (pour fermer)</span><textarea id="closeNote" placeholder="ex. Pièce remplacée, bon de travail #1234…"></textarea></label>
-         <div class="actions"><button class="btn primary" data-act="closeIssue" data-id="${i.id}">✓ Marquer réglé</button><button class="btn" data-act="addIssuePhoto" data-id="${i.id}">📷 Photo</button><button class="btn" data-act="closeSheet">Fermer</button></div>`
+         <div class="actions"><button class="btn primary" data-act="closeIssue" data-id="${i.id}">✓ Marquer réglé</button>${photoBtns('addIssuePhoto', `data-id="${i.id}"`)}<button class="btn" data-act="closeSheet">Fermer</button></div>`
       : `<p>${esc(i.closeNote || '')}</p><div class="actions"><button class="btn" data-act="reopenIssue" data-id="${i.id}">Rouvrir</button><button class="btn" data-act="closeSheet">Fermer</button></div>`}`);
 }
 // Brouillon du suivi en cours de création : ses photos sont prises avant que le suivi existe
@@ -500,8 +509,9 @@ function newIssueSheet(bid) {
     <label class="field"><span>École</span><select id="niBld">${blds.map(b => `<option value="${b.id}" ${b.id === bid ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select></label>
     <label class="field"><span>Endroit / élément</span><input type="text" id="niLabel" placeholder="ex. Local 204 — porte"></label>
     <label class="field"><span>Description</span><textarea id="niNote"></textarea></label>
+    <label class="field"><span>No de requête CSSPI (facultatif)</span><span class="inrow"><input type="text" id="niCsspi" inputmode="numeric" maxlength="12" placeholder="8 chiffres">${canScan() ? `<button class="btn" data-act="scanCsspi" data-target="niCsspi" aria-label="Scanner le code-barres">▥ Scanner</button>` : ''}</span></label>
     <div class="thumbs" id="niThumbs"></div>
-    <div class="actions"><button class="btn primary" data-act="createIssue">Créer</button><button class="btn" data-act="addDraftPhoto">📷 Photo</button><button class="btn" data-act="closeSheet">Annuler</button></div>`);
+    <div class="actions"><button class="btn primary" data-act="createIssue">Créer</button>${photoBtns('addDraftPhoto', '')}<button class="btn" data-act="closeSheet">Annuler</button></div>`);
   issueDraft = { id: uid(), photos: [] };
 }
 
@@ -991,8 +1001,8 @@ const ACT = {
   setStatusSheet: async b => { await setStatus(b.dataset.round, b.dataset.task, b.dataset.st); if (b.dataset.st !== 'todo' || !S.rounds.get(b.dataset.round).results[b.dataset.task].status) openTaskSheet(b.dataset.round, b.dataset.task); },
   taskSheet: b => openTaskSheet(b.dataset.round, b.dataset.task),
   closeSheet: () => closeSheet(),
-  addPhoto: b => { photoCtx = { type: 'round', id: b.dataset.round, taskId: b.dataset.task }; flushSheetNotes(); $('#photoInput').click(); },
-  addIssuePhoto: b => { photoCtx = { type: 'issue', id: b.dataset.id }; flushSheetNotes(); $('#photoInput').click(); },
+  addPhoto: b => { photoCtx = { type: 'round', id: b.dataset.round, taskId: b.dataset.task }; flushSheetNotes(); pickPhoto(b); },
+  addIssuePhoto: b => { photoCtx = { type: 'issue', id: b.dataset.id }; flushSheetNotes(); pickPhoto(b); },
   viewPhoto: async b => { const p = await DB.get('photos', b.dataset.id); if (p && !p.data && p.url) { window.open(p.url, '_blank', 'noopener'); return; } if (p) { const w = window.open(); if (w) w.document.write(`<title>Photo</title><img src="${p.data}" style="max-width:100%">`); } },
   endRound: async b => {
     const r = S.rounds.get(b.dataset.round); const total = flatTasks().length, done = flatTasks().filter(x => r.results[x.task.id]?.status).length;
@@ -1015,21 +1025,27 @@ const ACT = {
   issueSheet: b => openIssueSheet(b.dataset.id),
   sendBon: b => sendBon(b.dataset.id),
   shareBon: () => deliverBon(true),
-  scanCsspi: async () => {
+  scanCsspi: async b => {
     flushSheetNotes();
     const v = await scanBarcode(); if (!v) return;
+    if (b.dataset.target) { const t = $('#' + b.dataset.target); if (t) t.value = v; return; }  // formulaire de création : vérifié à « Créer »
     const el = $('#sheetBody [data-change="issueCsspi"]');
     if (el) { el.value = v; await CHG.issueCsspi(el); }
   },
   bldIssues: b => { S.ui.issueBld = b.dataset.bld; S.ui.issueTab = 'open'; if (location.hash === '#/suivi') render(); else location.hash = '#/suivi'; },
   newIssue: b => newIssueSheet(b.dataset.bld),
-  addDraftPhoto: () => { if (!issueDraft) return; photoCtx = { type: 'draft', id: issueDraft.id }; $('#photoInput').click(); },
+  addDraftPhoto: b => { if (!issueDraft) return; photoCtx = { type: 'draft', id: issueDraft.id }; pickPhoto(b); },
   createIssue: async () => {
     const bid = $('#niBld').value, label = $('#niLabel').value.trim(), note = $('#niNote').value.trim();
+    const csEl = $('#niCsspi'), csspi = (csEl?.value || '').replace(/\s+/g, '');
     if (!label) { toast('Indique l\'endroit / élément.'); return; }
+    if (csEl) csEl.value = csspi;
+    const warn = checkCsspi(csspi, bid);
+    if (warn && !confirm(warn + ' Le garder quand même ?')) { csEl?.focus(); return; }
     const d = issueDraft || { id: uid(), photos: [] }; issueDraft = null;
     const i = { id: d.id, no: newIssueNo(bid), by: S.settings.worker || '', buildingId: bid, roundId: '', taskId: '', label, createdAt: nowISO(), note, status: 'open', closedAt: null, closeNote: '', photos: [...d.photos] };
-    await saveIssue(i); addLog('suivi.ouvert', `Suivi ouvert : ${i.no} - ${label}${i.photos.length ? ` (${i.photos.length} photo${i.photos.length > 1 ? 's' : ''})` : ''}`, { buildingId: bid, issueId: i.id });
+    if (csspi) i.csspi = csspi;
+    await saveIssue(i); addLog('suivi.ouvert', `Suivi ouvert : ${issueNo(i)} - ${label}${csspi ? ` (CSSPI ${csspi})` : ''}${i.photos.length ? ` (${i.photos.length} photo${i.photos.length > 1 ? 's' : ''})` : ''}`, { buildingId: bid, issueId: i.id });
     closeSheet(); toast('Suivi créé'); render();
   },
   closeIssue: async b => {
@@ -1136,7 +1152,7 @@ document.addEventListener('toggle', e => { const d = e.target; if (d.matches?.('
 // fermeture par le bouton Retour / Échap (sans passer par closeSheet) ; si un formulaire s'est déjà rouvert, on garde son brouillon
 $('#sheet').addEventListener('close', () => { flushSheetNotes(); if (!$('#sheet').open) dropIssueDraft(); });
 $('#sheet').addEventListener('click', e => { if (e.target.id === 'sheet') closeSheet(); });
-$('#photoInput').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; onPhotoPicked(f); });
+for (const inp of ['#photoInput', '#galleryInput']) $(inp).addEventListener('change', e => { const fs = [...e.target.files]; e.target.value = ''; onPhotosPicked(fs); });
 $('#importInput').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) restore(f); });
 window.addEventListener('hashchange', () => { closeSheet(); render(); window.scrollTo(0, 0); });
 window.addEventListener('online', () => { refreshPill(); if (S.settings.autoSync) syncNow(false); });
