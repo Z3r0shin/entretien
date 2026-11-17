@@ -283,10 +283,11 @@ async function scanBarcode() {
     tick();
   });
 }
-// Vérifie un no de requête CSSPI : 8 chiffres, et les 3 premiers = préfixe de l'école.
+// No de requête CSSPI : 3 chiffres (préfixe de l'école) + 1 lettre + 5 chiffres, ex. 057A12345.
+const cleanCsspi = s => String(s || '').replace(/[\s-]+/g, '').toUpperCase();
 function checkCsspi(v, buildingId) {
   if (!v) return '';
-  if (!/^\d{8}$/.test(v)) return `« ${v} » n'a pas 8 chiffres.`;
+  if (!/^\d{3}[A-Z]\d{5}$/.test(v)) return `« ${v} » n'a pas la forme habituelle 000X00000 (3 chiffres, 1 lettre, 5 chiffres).`;
   const p = bldPrefix(buildingId);
   if (p && p !== '000' && !v.startsWith(p)) return `Ce numéro commence par ${v.slice(0, 3)}, mais le préfixe de ${bName(buildingId)} est ${p}.`;
   return '';

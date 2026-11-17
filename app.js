@@ -1,6 +1,6 @@
 'use strict';
 /* Entretien préventif — app hors-ligne (PWA). Données dans IndexedDB sur l'appareil. */
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.3.2';
 // Adresse retirée en 1.0.1 : elle pointait vers l'app d'inventaire des filtres, pas vers le script de cette app.
 const RETIRED_SYNC_URL_PART = 'AKfycbwkJyZ63CFji';
 // Script « Entretien préventif — Synchro » (projet séparé). Le jeton secret, lui, n'est jamais dans le code.
@@ -483,7 +483,7 @@ function openIssueSheet(id) {
   const i = S.issues.get(id); if (!i) return;
   openSheet(`<h3><span class="no">${issueNo(i)}</span> ${esc(i.label)}</h3><p class="muted">${esc(bName(i.buildingId))} · ouvert le ${fmtDT(i.createdAt)}${i.closedAt ? ' · fermé le ' + fmtDT(i.closedAt) : ''}${i.sentAt ? ' · bon envoyé le ' + fmtDT(i.sentAt) : ''}</p>
     <label class="field"><span>Description</span><textarea data-change="issueNote" data-id="${i.id}">${esc(i.note || '')}</textarea></label>
-    <label class="field"><span>No de requête CSSPI</span><span class="inrow"><input type="text" inputmode="numeric" maxlength="12" placeholder="8 chiffres" data-change="issueCsspi" data-id="${i.id}" value="${esc(i.csspi || '')}">${canScan() ? `<button class="btn" data-act="scanCsspi" data-id="${i.id}" aria-label="Scanner le code-barres">▥ Scanner</button>` : ''}</span></label>
+    <label class="field"><span>No de requête CSSPI</span><span class="inrow"><input type="text" autocapitalize="characters" autocomplete="off" spellcheck="false" maxlength="12" placeholder="ex. 057A12345" data-change="issueCsspi" data-id="${i.id}" value="${esc(i.csspi || '')}">${canScan() ? `<button class="btn" data-act="scanCsspi" data-id="${i.id}" aria-label="Scanner le code-barres">▥ Scanner</button>` : ''}</span></label>
     <button class="btn block" data-act="sendBon" data-id="${i.id}">📤 Envoyer le bon (PDF)</button>
     <div class="thumbs">${(i.photos || []).map(p => `<img data-photo="${p}" alt="Photo" data-act="viewPhoto" data-id="${p}">`).join('')}</div>
     ${i.status === 'open'
@@ -509,7 +509,7 @@ function newIssueSheet(bid) {
     <label class="field"><span>École</span><select id="niBld">${blds.map(b => `<option value="${b.id}" ${b.id === bid ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select></label>
     <label class="field"><span>Endroit / élément</span><input type="text" id="niLabel" placeholder="ex. Local 204 — porte"></label>
     <label class="field"><span>Description</span><textarea id="niNote"></textarea></label>
-    <label class="field"><span>No de requête CSSPI (facultatif)</span><span class="inrow"><input type="text" id="niCsspi" inputmode="numeric" maxlength="12" placeholder="8 chiffres">${canScan() ? `<button class="btn" data-act="scanCsspi" data-target="niCsspi" aria-label="Scanner le code-barres">▥ Scanner</button>` : ''}</span></label>
+    <label class="field"><span>No de requête CSSPI (facultatif)</span><span class="inrow"><input type="text" id="niCsspi" autocapitalize="characters" autocomplete="off" spellcheck="false" maxlength="12" placeholder="ex. 057A12345">${canScan() ? `<button class="btn" data-act="scanCsspi" data-target="niCsspi" aria-label="Scanner le code-barres">▥ Scanner</button>` : ''}</span></label>
     <div class="thumbs" id="niThumbs"></div>
     <div class="actions"><button class="btn primary" data-act="createIssue">Créer</button>${photoBtns('addDraftPhoto', '')}<button class="btn" data-act="closeSheet">Annuler</button></div>`);
   issueDraft = { id: uid(), photos: [] };
@@ -1037,7 +1037,7 @@ const ACT = {
   addDraftPhoto: b => { if (!issueDraft) return; photoCtx = { type: 'draft', id: issueDraft.id }; pickPhoto(b); },
   createIssue: async () => {
     const bid = $('#niBld').value, label = $('#niLabel').value.trim(), note = $('#niNote').value.trim();
-    const csEl = $('#niCsspi'), csspi = (csEl?.value || '').replace(/\s+/g, '');
+    const csEl = $('#niCsspi'), csspi = cleanCsspi(csEl?.value);
     if (!label) { toast('Indique l\'endroit / élément.'); return; }
     if (csEl) csEl.value = csspi;
     const warn = checkCsspi(csspi, bid);
@@ -1108,7 +1108,7 @@ const CHG = {
   roundNote: async el => { const r = S.rounds.get(el.dataset.round); if ((r.notes || '') === el.value) return; r.notes = el.value; r.metaMt = nowISO(); await saveRound(r); addLog('tournee.note', `Note de tournée : « ${el.value.slice(0, 80)} »`, { buildingId: r.buildingId, roundId: r.id }); },
   taskNote: el => saveTaskNote(el.dataset.round, el.dataset.task, el.value.trim()),
   issueCsspi: async el => {
-    const i = S.issues.get(el.dataset.id); const v = el.value.replace(/\s+/g, ''); el.value = v;
+    const i = S.issues.get(el.dataset.id); const v = cleanCsspi(el.value); el.value = v;
     if ((i.csspi || '') === v) return;
     const warn = checkCsspi(v, i.buildingId);
     if (warn && !confirm(warn + ' Le garder quand même ?')) { el.value = i.csspi || ''; return; }
